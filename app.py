@@ -1,6 +1,6 @@
 import os
-import io
 import re
+import io
 import json
 import secrets
 from datetime import datetime, timedelta
@@ -8,27 +8,33 @@ from typing import List, Optional, Dict, Any
 
 import pdfplumber
 import pandas as pd
-from fastapi import FastAPI, UploadFile, File, HTTPException, Request
+from tenacity import retry, stop_after_attempt, wait_exponential_jitter
+from dotenv import load_dotenv
+
+from fastapi import FastAPI, File, Form, UploadFile, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse, JSONResponse
-from dotenv import load_dotenv
-from tenacity import retry, stop_after_attempt, wait_exponential_jitter
+
+try:
+    from openai import OpenAI
+except Exception:
+    OpenAI = None
+
 
 # =========================
-# CORS (ajusta dominios según tu Wix)
+# CONFIGURACIÓN GENERAL
 # =========================
+app = FastAPI(title="Generador de Matrices – Dipli")
+
 ALLOWED_ORIGINS = [
     "https://www.dipli.ai",
     "https://dipli.ai",
-    "https://isagarcivill09.wixsite.com",
     "https://isagarcivill09.wixsite.com/turop",
     "https://isagarcivill09.wixsite.com/turop/tienda",
     "https://isagarcivill09-wixsite-com.filesusr.com",
+    "https://www.dipli.ai/preparaci%C3%B3n",
     "https://www-dipli-ai.filesusr.com",
 ]
-
-app = FastAPI(title="Generador de Matriz Dipli API")
-
 app.add_middleware(
     CORSMiddleware,
     allow_origins=ALLOWED_ORIGINS,
@@ -39,230 +45,16 @@ app.add_middleware(
 )
 
 # =========================
-# OpenAI
+# DOWNLOADS TEMPORALES
 # =========================
-try:
-    from openai import OpenAI
-except Exception:
-    OpenAI = None
-
-
-class LLMClient:
-    def __init__(self, model: Optional[str]):
-        load_dotenv()
-        if OpenAI is None:
-            raise RuntimeError("Falta la librería openai>=1.30.0. Instálala con: pip install openai")
-
-        api_key = os.getenv("OPENAI_API_KEY")
-        if not api_key:
-            raise RuntimeError("Debes definir OPENAI_API_KEY en entorno o .env")
-
-        self.model = (model or os.getenv("OPENAI_MODEL") or "gpt-4o-mini").strip()
-        self.client = OpenAI(api_key=api_key)
-
-    @retry(stop=stop_after_attempt(3), wait=wait_exponential_jitter(1, 8))
-    def chat(self, system: str, user: str, temperature: float = 0.2) -> str:
-        resp = self.client.chat.completions.create(
-            model=self.model,
-            temperature=temperature,
-            messages=[{"role": "system", "content": system},
-                      {"role": "user", "content": user}],
-        )
-        return resp.choices[0].message.content
-
-    @retry(stop=stop_after_attempt(3), wait=wait_exponential_jitter(1, 8))
-    def chat_json(self, system: str, user: str, temperature: float = 0.1) -> str:
-        resp = self.client.chat.completions.create(
-            model=self.model,
-            temperature=temperature,
-            response_format={"type": "json_object"},
-            messages=[{"role": "system", "content": system},
-                      {"role": "user", "content": user}],
-        )
-        return resp.choices[0].message.content
-
-
-# =========================
-# Utilidades de PDF / texto
-# =========================
-def extract_text_from_pdf_bytes(file_bytes: bytes) -> str:
-    if not file_bytes:
-        return ""
-    with pdfplumber.open(io.BytesIO(file_bytes)) as pdf:
-        return "\n".join((page.extract_text() or "") for page in pdf.pages)
-
-
-def split_into_chunks(text: str, max_chars: int = 8000) -> List[str]:
-    if len(text) <= max_chars:
-        return [text]
-    chunks, start = [], 0
-    while start < len(text):
-        end = min(start + max_chars, len(text))
-        if end < len(text):
-            nl = text.rfind("\n", start, end)
-            if nl != -1 and (nl - start) > max_chars * 0.5:
-                end = nl
-        chunks.append(text[start:end])
-        start = end
-    return chunks
-
-
-def hierarchical_summarize(llm: LLMClient, raw_text: str, label: str) -> str:
-    chunks = split_into_chunks(raw_text)
-    summaries = []
-    sys = ("Eres un analista senior. Resume con foco en: actores, procesos, definiciones, "
-           "restricciones y términos clave. Usa viñetas concisas.")
-    for i, ch in enumerate(chunks, 1):
-        user = f"Resumen parcial {label} ({i}/{len(chunks)}):\n\n{ch}"
-        summaries.append(llm.chat(sys, user, temperature=0.0))
-    combined = "\n\n".join(f"- Bloque {i+1}: {s}" for i, s in enumerate(summaries))
-    return llm.chat(sys, f"Fusiona y depura en 12–18 viñetas claras, sin redundancias:\n\n{combined}", temperature=0.0)
-
-
-def extract_questions_from_text(text: str) -> List[str]:
-    lines = [l.strip() for l in (text or "").splitlines() if l.strip()]
-    q = []
-    for l in lines:
-        if l.endswith("?") or l.startswith("¿") or re.search(r"\?\s*$", l):
-            q.append(l)
-    out, seen = [], set()
-    for s in q:
-        if s not in seen:
-            seen.add(s)
-            out.append(s)
-    return out
-
-
-# =========================
-# Generación de matriz
-# =========================
-MATRIX_INSTRUCTIONS = """
-Devuelve un JSON válido con esta estructura:
-{
-  "capitulos": [
-    {
-      "titulo": "string",
-      "subcapitulos": [
-        {
-          "titulo": "string",
-          "preguntas": ["string", ...]
-        }
-      ]
-    }
-  ]
-}
-"""
-
-def extract_json_block(text: str) -> Optional[str]:
-    if not text:
-        return None
-    start = text.find("{")
-    if start == -1:
-        return None
-    depth = 0
-    for i in range(start, len(text)):
-        ch = text[i]
-        if ch == "{":
-            depth += 1
-        elif ch == "}":
-            depth -= 1
-            if depth == 0:
-                return text[start:i + 1]
-    return None
-
-
-def safe_json_loads(s: str) -> Dict[str, Any]:
-    if not s:
-        raise ValueError("Respuesta vacía del LLM.")
-    s = s.strip()
-    if s.startswith("```"):
-        s = s.strip("`")
-        s = s.replace("json\n", "", 1).replace("json\r\n", "", 1)
-    try:
-        return json.loads(s)
-    except Exception:
-        blk = extract_json_block(s)
-        if blk:
-            return json.loads(blk)
-        raise
-
-
-def build_matrix_with_llm(llm: LLMClient, contexto_sum: str, objetivos_sum: str, preguntas: Optional[List[str]]) -> Dict[str, Any]:
-    sys = "Eres un Research Lead experto en cualitativo. Diseñas guías y estructuras analíticas limpias y accionables."
-    if preguntas:
-        pregunta_blob = "\n".join(f"- {p}" for p in preguntas)
-        user = f"""CONTEXTO (resumen):
-{contexto_sum}
-
-OBJETIVOS (resumen):
-{objetivos_sum}
-
-GUIA (preguntas originales, no edites el texto):
-{pregunta_blob}
-
-{MATRIX_INSTRUCTIONS}
-"""
-    else:
-        user = f"""CONTEXTO (resumen):
-{contexto_sum}
-
-OBJETIVOS (resumen):
-{objetivos_sum}
-
-NO se proporcionó guía. Debes proponer capítulos, subcapítulos y preguntas.
-{MATRIX_INSTRUCTIONS}
-"""
-
-    try:
-        raw = llm.chat_json(sys, user, temperature=0.15)
-        return safe_json_loads(raw)
-    except Exception:
-        raw_fallback = llm.chat(sys, user, temperature=0.15)
-        try:
-            return safe_json_loads(raw_fallback)
-        except Exception:
-            fix = llm.chat_json(
-                "Eres un validador estricto de JSON. Devuelve únicamente un objeto JSON válido.",
-                f"Corrige a JSON válido esta salida (no añadas texto fuera del objeto):\n\n{raw_fallback}",
-                temperature=0.0,
-            )
-            return safe_json_loads(fix)
-
-
-def to_dataframe(matrix: Dict[str, Any]) -> pd.DataFrame:
-    rows = []
-    for cap in matrix.get("capitulos", []):
-        cap_title = (cap.get("titulo") or "").strip()
-        for sub in cap.get("subcapitulos", []):
-            sub_title = (sub.get("titulo") or "").strip()
-            for q in sub.get("preguntas", []) or []:
-                rows.append({"Capitulo": cap_title, "Subcapitulo": sub_title, "Preguntas": (q or "").strip()})
-    return pd.DataFrame(rows, columns=["Capitulo", "Subcapitulo", "Preguntas"])
-
-
-# =========================
-# Descarga por token (memoria)
-# =========================
-TOKEN_TTL_SECONDS = int(os.getenv("TOKEN_TTL_SECONDS", "1800"))  # 30 min por defecto
-DOWNLOADS: Dict[str, tuple[bytes, str, str, datetime]] = {}
-
+DOWNLOADS: Dict[str, Any] = {}
+TTL_MINUTES = 30
 
 def cleanup_downloads():
-    """Elimina entradas expiradas del almacenamiento en memoria."""
     now = datetime.utcnow()
     expired = [k for k, (_, _, _, exp) in DOWNLOADS.items() if exp <= now]
     for k in expired:
         DOWNLOADS.pop(k, None)
-
-
-def push_download(data: bytes, filename: str, media_type: str) -> str:
-    """Crea un token y guarda en memoria el binario + metadatos."""
-    cleanup_downloads()
-    token = secrets.token_urlsafe(16)
-    exp = datetime.utcnow() + timedelta(seconds=TOKEN_TTL_SECONDS)
-    DOWNLOADS[token] = (data, filename, media_type, exp)
-    return token
-
 
 @app.get("/download/{token}")
 def download_token(token: str):
@@ -283,67 +75,223 @@ def download_token(token: str):
 
 
 # =========================
-# Endpoints
+# FUNCIONES BASE
 # =========================
-@app.get("/health")
-def health():
-    return {"status": "ok", "utc": datetime.utcnow().isoformat()}
+def split_into_chunks(text: str, max_chars: int = 8000) -> List[str]:
+    if len(text) <= max_chars:
+        return [text]
+    chunks, start = [], 0
+    while start < len(text):
+        end = min(start + max_chars, len(text))
+        if end < len(text):
+            nl = text.rfind("\n", start, end)
+            if nl != -1 and (nl - start) > max_chars * 0.5:
+                end = nl
+        chunks.append(text[start:end])
+        start = end
+    return chunks
 
-@app.post("/generate_matrix")
+def extract_text_from_pdf_bytes(data: bytes) -> str:
+    texts = []
+    with pdfplumber.open(io.BytesIO(data)) as pdf:
+        for page in pdf.pages:
+            txt = page.extract_text() or ""
+            texts.append(txt)
+    return "\n".join(texts)
+
+
+# =========================
+# CLIENTE OPENAI
+# =========================
+class LLMClient:
+    def __init__(self, model: Optional[str], api_key_override: Optional[str] = None):
+        load_dotenv()
+        if OpenAI is None:
+            raise RuntimeError("Falta la librería openai>=1.30.0. Instálala con: pip install openai")
+
+        api_key = api_key_override or os.getenv("OPENAI_API_KEY")
+        if not api_key:
+            raise RuntimeError("OPENAI_API_KEY no configurada. Pásala en el form-data (openai_api_key) o variable de entorno.")
+        os.environ["OPENAI_API_KEY"] = api_key
+
+        self.model = (model or os.getenv("OPENAI_MODEL") or "gpt-4o-mini").strip()
+        self.client = OpenAI()
+        self.total_tokens = 0
+        self.prompt_tokens = 0
+        self.completion_tokens = 0
+
+    def _accumulate_usage(self, resp):
+        try:
+            u = getattr(resp, "usage", None)
+            if not u:
+                return
+            if hasattr(u, "total_tokens"):
+                self.total_tokens += int(getattr(u, "total_tokens", 0) or 0)
+                self.prompt_tokens += int(getattr(u, "prompt_tokens", 0) or 0)
+                self.completion_tokens += int(getattr(u, "completion_tokens", 0) or 0)
+            elif isinstance(u, dict):
+                self.total_tokens += int(u.get("total_tokens") or 0)
+                self.prompt_tokens += int(u.get("prompt_tokens") or 0)
+                self.completion_tokens += int(u.get("completion_tokens") or 0)
+        except Exception:
+            pass
+
+    @retry(stop=stop_after_attempt(3), wait=wait_exponential_jitter(1, 8))
+    def chat(self, system: str, user: str, temperature: float = 0.2) -> str:
+        resp = self.client.chat.completions.create(
+            model=self.model,
+            temperature=temperature,
+            messages=[{"role": "system", "content": system}, {"role": "user", "content": user}],
+        )
+        self._accumulate_usage(resp)
+        return resp.choices[0].message.content
+
+    @retry(stop=stop_after_attempt(3), wait=wait_exponential_jitter(1, 8))
+    def chat_json(self, system: str, user: str, temperature: float = 0.1) -> str:
+        resp = self.client.chat.completions.create(
+            model=self.model,
+            temperature=temperature,
+            response_format={"type": "json_object"},
+            messages=[{"role": "system", "content": system}, {"role": "user", "content": user}],
+        )
+        self._accumulate_usage(resp)
+        return resp.choices[0].message.content
+
+
+# =========================
+# RESUMEN
+# =========================
+def hierarchical_summarize(llm: LLMClient, raw_text: str, label: str) -> str:
+    chunks = split_into_chunks(raw_text)
+    summaries = []
+    sys = "Eres un analista senior. Resume con foco en actores, procesos, restricciones y términos clave. Usa viñetas concisas."
+    for i, ch in enumerate(chunks, 1):
+        user = f"Resumen parcial {label} ({i}/{len(chunks)}):\n\n{ch}"
+        summaries.append(llm.chat(sys, user))
+    combined = "\n\n".join(f"- Bloque {i+1}: {s}" for i, s in enumerate(summaries))
+    final = llm.chat(sys, f"Fusiona y depura en 12–18 viñetas claras:\n\n{combined}")
+    return final
+
+
+# =========================
+# EXTRACCIÓN DE PREGUNTAS
+# =========================
+_INTERROGATIVOS = r"(qué|como|cómo|cual|cuál|cuando|cuándo|donde|dónde|quien|quién|por qué|para qué|cuanto|cuánto|cuales|cuáles)"
+def _clean_line(s: str) -> str:
+    s = s.strip("•-· ").strip()
+    return re.sub(r"\s+", " ", s)
+
+def _is_questionish(s: str) -> bool:
+    return bool("?" in s or "¿" in s or re.match(rf"^\s*{_INTERROGATIVOS}\b", s, re.IGNORECASE))
+
+def extract_questions_from_text_v2(text: str) -> List[str]:
+    if not text:
+        return []
+    lines = [_clean_line(l) for l in text.splitlines() if l.strip()]
+    out, seen = [], set()
+    for l in lines:
+        if _is_questionish(l):
+            k = re.sub(r"[\W_]+", "", l.lower())
+            if k not in seen:
+                seen.add(k)
+                if not l.endswith("?"): l += "?"
+                out.append(l)
+    return out
+
+
+# =========================
+# CONSTRUCCIÓN MATRIZ
+# =========================
+def build_matrix_with_llm(llm: LLMClient, contexto_sum: str, objetivos_sum: str, preguntas: Optional[List[str]]) -> Dict[str, Any]:
+    sys = "Eres Research Lead. Diseñas guías cualitativas limpias y estructuradas."
+    if preguntas:
+        pregunta_blob = "\n".join(f"- {p}" for p in preguntas)
+        user = f"CONTEXTO:\n{contexto_sum}\n\nOBJETIVOS:\n{objetivos_sum}\n\nGUIA:\n{pregunta_blob}\n\nDevuelve JSON con capítulos, subcapítulos y preguntas."
+    else:
+        user = f"CONTEXTO:\n{contexto_sum}\n\nOBJETIVOS:\n{objetivos_sum}\n\nGenera estructura analítica JSON (capítulos y subcapítulos)."
+    raw = llm.chat_json(sys, user)
+    return json.loads(raw)
+
+
+def to_dataframe(matrix: Dict[str, Any]) -> pd.DataFrame:
+    rows = []
+    for c in matrix.get("capitulos", []):
+        cap = (c.get("titulo") or "").strip()
+        for s in c.get("subcapitulos", []):
+            sub = (s.get("titulo") or "").strip()
+            for q in s.get("preguntas", []):
+                rows.append({"Capitulo": cap, "Subcapitulo": sub, "Preguntas": q})
+    return pd.DataFrame(rows)
+
+
+# =========================
+# ENDPOINT PRINCIPAL
+# =========================
+@app.post("/generate-matrix")
 async def generate_matrix(
-    request: Request,
     contexto: UploadFile = File(...),
     objetivos: UploadFile = File(...),
-    guia: Optional[UploadFile] = None,
-    model: Optional[str] = "gpt-4o-mini",
+    guia: Optional[UploadFile] = File(None),
+    openai_api_key: Optional[str] = Form(None),
+    model: Optional[str] = Form(None),
+    filename_base: Optional[str] = Form("matriz.xlsx"),
 ):
-    """
-    Sube CONTEXTO.pdf, OBJETIVOS.pdf y opcionalmente GUIA.pdf.
-    Respuesta: JSON con { download_url, token, expires_at } para descargar matriz.xlsx
-    """
-    try:
-        contexto_bytes = await contexto.read()
-        objetivos_bytes = await objetivos.read()
-        guia_bytes = await guia.read() if guia else None
+    cleanup_downloads()
 
-        llm = LLMClient(model)
+    ctx_bytes = await contexto.read()
+    obj_bytes = await objetivos.read()
+    guia_bytes = await guia.read() if guia else None
 
-        # Resúmenes
-        ctx_text = extract_text_from_pdf_bytes(contexto_bytes)
-        obj_text = extract_text_from_pdf_bytes(objetivos_bytes)
-        if not ctx_text.strip():
-            raise HTTPException(status_code=400, detail="El CONTEXTO no contiene texto detectable.")
-        if not obj_text.strip():
-            raise HTTPException(status_code=400, detail="Los OBJETIVOS no contienen texto detectable.")
+    llm = LLMClient(model=model, api_key_override=openai_api_key)
+    ctx_raw = extract_text_from_pdf_bytes(ctx_bytes)
+    obj_raw = extract_text_from_pdf_bytes(obj_bytes)
+    ctx_sum = hierarchical_summarize(llm, ctx_raw, "Contexto")
+    obj_sum = hierarchical_summarize(llm, obj_raw, "Objetivos")
 
-        ctx_sum = hierarchical_summarize(llm, ctx_text, "Contexto")
-        obj_sum = hierarchical_summarize(llm, obj_text, "Objetivos")
+    preguntas = extract_questions_from_text_v2(extract_text_from_pdf_bytes(guia_bytes)) if guia_bytes else []
+    matrix = build_matrix_with_llm(llm, ctx_sum, obj_sum, preguntas)
+    df = to_dataframe(matrix)
+    if df.empty:
+        raise HTTPException(status_code=500, detail="Matriz vacía")
 
-        # Preguntas opcionales desde GUIA
-        preguntas = extract_questions_from_text(extract_text_from_pdf_bytes(guia_bytes)) if guia_bytes else None
+    output = io.BytesIO()
+    with pd.ExcelWriter(output, engine="xlsxwriter") as writer:
+        df.to_excel(writer, sheet_name="Matriz", index=False)
+        pd.DataFrame([
+            ["Preguntas detectadas", len(preguntas)],
+            ["Tokens totales", llm.total_tokens],
+            ["Prompt tokens", llm.prompt_tokens],
+            ["Completion tokens", llm.completion_tokens],
+        ], columns=["Métrica", "Valor"]).to_excel(writer, sheet_name="Métricas", index=False)
+    output.seek(0)
 
-        # Matriz
-        matrix = build_matrix_with_llm(llm, ctx_sum, obj_sum, preguntas)
-        df = to_dataframe(matrix)
-        if df.empty:
-            raise HTTPException(status_code=422, detail="La matriz resultó vacía. Revisa los documentos de entrada.")
+    token = secrets.token_urlsafe(16)
+    filename = filename_base if filename_base.endswith(".xlsx") else f"{filename_base}.xlsx"
+    DOWNLOADS[token] = (
+        output.getvalue(),
+        filename,
+        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        datetime.utcnow() + timedelta(minutes=TTL_MINUTES),
+    )
 
-        # Excel a memoria + token
-        buf = io.BytesIO()
-        df.to_excel(buf, index=False)
-        data = buf.getvalue()
+    return JSONResponse({
+        "status": "ok",
+        "download_url": f"/download/{token}",
+        "filename": filename,
+        "detected_questions": len(preguntas),
+        "tokens": {
+            "total": llm.total_tokens,
+            "prompt": llm.prompt_tokens,
+            "completion": llm.completion_tokens,
+        },
+        "expires_in_minutes": TTL_MINUTES,
+    })
 
-        filename = "matriz.xlsx"
-        media_type = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-        token = push_download(data, filename, media_type)
-        exp = DOWNLOADS[token][3].isoformat()
 
-        # URL absoluta basada en la request
-        download_url = request.url_for("download_token", token=token)
-
-        return JSONResponse({"download_url": str(download_url), "token": token, "expires_at": exp})
-
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+# =========================
+# HEALTHCHECK
+# =========================
+@app.get("/healthz")
+def health():
+    cleanup_downloads()
+    return {"ok": True}
