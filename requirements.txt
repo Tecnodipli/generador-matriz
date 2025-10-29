@@ -2,7 +2,8 @@ fastapi
 uvicorn
 pdfplumber
 pandas
-openai>=1.30.0
+openai>=2.0.0
 tenacity
-python-multipart
 python-dotenv
+python-multipart
+xlsxwriter
