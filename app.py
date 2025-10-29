@@ -1,3 +1,4 @@
+# app.py
 import os
 import re
 import io
@@ -11,7 +12,7 @@ import pandas as pd
 from tenacity import retry, stop_after_attempt, wait_exponential_jitter
 from dotenv import load_dotenv
 
-from fastapi import FastAPI, File, Form, UploadFile, HTTPException, Request
+from fastapi import FastAPI, File, Form, UploadFile, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse, JSONResponse
 
@@ -101,7 +102,7 @@ def extract_text_from_pdf_bytes(data: bytes) -> str:
 
 
 # =========================
-# CLIENTE OPENAI
+# CLIENTE OPENAI (con conteo de tokens)
 # =========================
 class LLMClient:
     def __init__(self, model: Optional[str], api_key_override: Optional[str] = None):
@@ -159,7 +160,7 @@ class LLMClient:
 
 
 # =========================
-# RESUMEN
+# RESUMEN JERÁRQUICO
 # =========================
 def hierarchical_summarize(llm: LLMClient, raw_text: str, label: str) -> str:
     chunks = split_into_chunks(raw_text)
@@ -174,28 +175,67 @@ def hierarchical_summarize(llm: LLMClient, raw_text: str, label: str) -> str:
 
 
 # =========================
-# EXTRACCIÓN DE PREGUNTAS
+# EXTRACCIÓN DE PREGUNTAS (VERSIÓN AVANZADA)
 # =========================
-_INTERROGATIVOS = r"(qué|como|cómo|cual|cuál|cuando|cuándo|donde|dónde|quien|quién|por qué|para qué|cuanto|cuánto|cuales|cuáles)"
+_INTERROGATIVOS = (
+    r"(qué|como|cómo|cual|cuál|cuando|cuándo|donde|dónde|quien|quién|por qué|para qué|cuanto|cuánto|cuales|cuáles)"
+)
+
 def _clean_line(s: str) -> str:
     s = s.strip("•-· ").strip()
-    return re.sub(r"\s+", " ", s)
+    s = re.sub(r"\s+", " ", s)
+    return s
 
 def _is_questionish(s: str) -> bool:
-    return bool("?" in s or "¿" in s or re.match(rf"^\s*{_INTERROGATIVOS}\b", s, re.IGNORECASE))
+    """Detecta si una línea suena a pregunta aunque no tenga signos."""
+    if "?" in s or "¿" in s:
+        return True
+    if re.match(rf"^\s*{_INTERROGATIVOS}\b", s, re.IGNORECASE):
+        return True
+    if re.match(r"^\s*(cuéntame|háblame|dime|menciona|explícame|relata|descríbeme|cómo fue|qué pasó|qué sintió|qué pensó|por favor cuéntame)", s, re.IGNORECASE):
+        return True
+    if re.match(r"^\s*(piensa|recuerda|comparte|cuenta|mencione|narre|indique|explique|detalla|describe)", s, re.IGNORECASE):
+        return True
+    return False
 
-def extract_questions_from_text_v2(text: str) -> List[str]:
+def extract_questions_from_text_v3(text: str) -> List[str]:
+    """
+    Extrae preguntas incluso si no tienen signo de interrogación,
+    basándose en tono y estructura gramatical.
+    """
     if not text:
         return []
     lines = [_clean_line(l) for l in text.splitlines() if l.strip()]
-    out, seen = [], set()
+    candidates = []
+    buffer = []
     for l in lines:
         if _is_questionish(l):
-            k = re.sub(r"[\W_]+", "", l.lower())
-            if k not in seen:
-                seen.add(k)
-                if not l.endswith("?"): l += "?"
-                out.append(l)
+            if buffer:
+                candidates.append(" ".join(buffer))
+                buffer = []
+            buffer.append(l)
+        elif buffer:
+            if len(l.split()) < 20 and not re.match(r"^[A-ZÁÉÍÓÚÑ]{2,}$", l):
+                buffer.append(l)
+            else:
+                candidates.append(" ".join(buffer))
+                buffer = []
+    if buffer:
+        candidates.append(" ".join(buffer))
+
+    # Limpieza y deduplicado
+    seen = set()
+    out = []
+    for q in candidates:
+        q = q.strip()
+        if len(q) < 4:
+            continue
+        norm = re.sub(r"[\W_]+", "", q.lower())
+        if norm not in seen:
+            seen.add(norm)
+            if not q.endswith("?"):
+                q += "?"
+            out.append(q)
     return out
 
 
@@ -206,12 +246,20 @@ def build_matrix_with_llm(llm: LLMClient, contexto_sum: str, objetivos_sum: str,
     sys = "Eres Research Lead. Diseñas guías cualitativas limpias y estructuradas."
     if preguntas:
         pregunta_blob = "\n".join(f"- {p}" for p in preguntas)
-        user = f"CONTEXTO:\n{contexto_sum}\n\nOBJETIVOS:\n{objetivos_sum}\n\nGUIA:\n{pregunta_blob}\n\nDevuelve JSON con capítulos, subcapítulos y preguntas."
+        user = (
+            f"CONTEXTO:\n{contexto_sum}\n\n"
+            f"OBJETIVOS:\n{objetivos_sum}\n\n"
+            f"GUIA:\n{pregunta_blob}\n\n"
+            "Devuelve JSON con capítulos, subcapítulos y preguntas."
+        )
     else:
-        user = f"CONTEXTO:\n{contexto_sum}\n\nOBJETIVOS:\n{objetivos_sum}\n\nGenera estructura analítica JSON (capítulos y subcapítulos)."
+        user = (
+            f"CONTEXTO:\n{contexto_sum}\n\n"
+            f"OBJETIVOS:\n{objetivos_sum}\n\n"
+            "Genera estructura analítica JSON (capítulos y subcapítulos)."
+        )
     raw = llm.chat_json(sys, user)
     return json.loads(raw)
-
 
 def to_dataframe(matrix: Dict[str, Any]) -> pd.DataFrame:
     rows = []
@@ -243,28 +291,38 @@ async def generate_matrix(
     guia_bytes = await guia.read() if guia else None
 
     llm = LLMClient(model=model, api_key_override=openai_api_key)
+
+    # Resúmenes
     ctx_raw = extract_text_from_pdf_bytes(ctx_bytes)
     obj_raw = extract_text_from_pdf_bytes(obj_bytes)
     ctx_sum = hierarchical_summarize(llm, ctx_raw, "Contexto")
     obj_sum = hierarchical_summarize(llm, obj_raw, "Objetivos")
 
-    preguntas = extract_questions_from_text_v2(extract_text_from_pdf_bytes(guia_bytes)) if guia_bytes else []
+    # Preguntas detectadas (v3)
+    preguntas = extract_questions_from_text_v3(extract_text_from_pdf_bytes(guia_bytes)) if guia_bytes else []
+
+    # Matriz
     matrix = build_matrix_with_llm(llm, ctx_sum, obj_sum, preguntas)
     df = to_dataframe(matrix)
     if df.empty:
         raise HTTPException(status_code=500, detail="Matriz vacía")
 
+    # Excel en memoria
     output = io.BytesIO()
     with pd.ExcelWriter(output, engine="xlsxwriter") as writer:
         df.to_excel(writer, sheet_name="Matriz", index=False)
-        pd.DataFrame([
-            ["Preguntas detectadas", len(preguntas)],
-            ["Tokens totales", llm.total_tokens],
-            ["Prompt tokens", llm.prompt_tokens],
-            ["Completion tokens", llm.completion_tokens],
-        ], columns=["Métrica", "Valor"]).to_excel(writer, sheet_name="Métricas", index=False)
+        pd.DataFrame(
+            [
+                ["Preguntas detectadas", len(preguntas)],
+                ["Tokens totales", llm.total_tokens],
+                ["Prompt tokens", llm.prompt_tokens],
+                ["Completion tokens", llm.completion_tokens],
+            ],
+            columns=["Métrica", "Valor"],
+        ).to_excel(writer, sheet_name="Métricas", index=False)
     output.seek(0)
 
+    # Registrar para descarga temporal
     token = secrets.token_urlsafe(16)
     filename = filename_base if filename_base.endswith(".xlsx") else f"{filename_base}.xlsx"
     DOWNLOADS[token] = (
@@ -274,18 +332,20 @@ async def generate_matrix(
         datetime.utcnow() + timedelta(minutes=TTL_MINUTES),
     )
 
-    return JSONResponse({
-        "status": "ok",
-        "download_url": f"/download/{token}",
-        "filename": filename,
-        "detected_questions": len(preguntas),
-        "tokens": {
-            "total": llm.total_tokens,
-            "prompt": llm.prompt_tokens,
-            "completion": llm.completion_tokens,
-        },
-        "expires_in_minutes": TTL_MINUTES,
-    })
+    return JSONResponse(
+        {
+            "status": "ok",
+            "download_url": f"/download/{token}",
+            "filename": filename,
+            "detected_questions": len(preguntas),
+            "tokens": {
+                "total": llm.total_tokens,
+                "prompt": llm.prompt_tokens,
+                "completion": llm.completion_tokens,
+            },
+            "expires_in_minutes": TTL_MINUTES,
+        }
+    )
 
 
 # =========================
