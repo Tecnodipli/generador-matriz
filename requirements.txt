@@ -4,4 +4,5 @@ pdfplumber
 pandas
 openai>=1.30.0
 tenacity
+python-multipart
 python-dotenv
