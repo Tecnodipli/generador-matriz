@@ -2,7 +2,6 @@ import os
 import io
 import re
 import json
-import tempfile
 import pdfplumber
 import pandas as pd
 from datetime import datetime, timedelta
@@ -49,17 +48,14 @@ TOKEN_EXPIRATION_MINUTES = 30
 # UTILS
 # =====================================================
 def cleanup_downloads():
-    """Elimina descargas expiradas."""
     now = datetime.utcnow()
     expired = [k for k, v in DOWNLOADS.items() if v[3] <= now]
     for k in expired:
         DOWNLOADS.pop(k, None)
 
-
 def generate_token() -> str:
     import secrets
     return secrets.token_urlsafe(16)
-
 
 def extract_text_from_pdf_bytes(file_bytes: bytes) -> str:
     texts = []
@@ -71,7 +67,7 @@ def extract_text_from_pdf_bytes(file_bytes: bytes) -> str:
 
 
 # =====================================================
-# LLM CLIENT (con conteo de tokens)
+# LLM CLIENT (con conteo real de tokens)
 # =====================================================
 class LLMClient:
     def __init__(self, model: str = "gpt-4o-mini", api_key: Optional[str] = None):
@@ -79,7 +75,7 @@ class LLMClient:
             raise RuntimeError("Falta la librería openai.")
         api_key = api_key or os.getenv("OPENAI_API_KEY")
         if not api_key:
-            raise RuntimeError("No hay clave de OpenAI.")
+            raise RuntimeError("No hay OPENAI_API_KEY configurada.")
         self.client = OpenAI(api_key=api_key)
         self.model = model
         self.total_tokens = 0
@@ -178,7 +174,7 @@ def extract_questions_from_text_v3(text: str) -> List[str]:
 
 
 # =====================================================
-# CONSTRUCCIÓN DE MATRIZ
+# CONSTRUCCIÓN DE MATRIZ (LLM)
 # =====================================================
 MATRIX_INSTRUCTIONS = """
 Devuelve un JSON válido con esta estructura EXACTA:
@@ -195,10 +191,9 @@ Devuelve un JSON válido con esta estructura EXACTA:
 
 Reglas:
 - Cada capítulo debe tener 2–3 subcapítulos.
-- TODAS las preguntas de la GUIA deben incluirse, sin editar su texto.
-- No dejes preguntas a nivel del capítulo.
-- No devuelvas objetos, solo strings en "preguntas".
-- Mantén orden lógico y títulos breves.
+- No dejes preguntas a nivel del capítulo (siempre dentro de "subcapitulos").
+- "preguntas" debe ser SIEMPRE un array de strings (nunca objetos).
+- Mantén orden lógico y títulos breves y consistentes.
 """
 
 def safe_json_loads(s: str) -> Dict[str, Any]:
@@ -213,31 +208,61 @@ def safe_json_loads(s: str) -> Dict[str, Any]:
             return json.loads(match.group(0))
         raise ValueError("No se pudo parsear JSON.")
 
-
-def build_matrix_with_llm(llm: LLMClient, contexto_sum: str, objetivos_sum: str, preguntas: List[str]) -> Dict[str, Any]:
+def build_matrix_with_llm(
+    llm: LLMClient,
+    contexto_sum: str,
+    objetivos_sum: str,
+    preguntas: Optional[List[str]],
+    num_questions_if_no_guide: Optional[int] = None
+) -> Dict[str, Any]:
+    """
+    Si 'preguntas' llega vacío, el LLM debe generar EXACTAMENTE 'num_questions_if_no_guide'
+    preguntas (por defecto 16). Devuelve matriz con capítulos y 2–3 subcapítulos.
+    """
     sys = "Eres un Research Lead experto en investigación cualitativa."
-    pregunta_blob = "\n".join(f"- {p}" for p in preguntas)
-    user = f"""CONTEXTO:
+
+    if preguntas:
+        pregunta_blob = "\n".join(f"- {p}" for p in preguntas)
+        user = f"""CONTEXTO:
 {contexto_sum}
 
 OBJETIVOS:
 {objetivos_sum}
 
-PREGUNTAS DE LA GUÍA:
+PREGUNTAS DE LA GUÍA (inclúyelas TODAS, sin editar):
 {pregunta_blob}
 
 {MATRIX_INSTRUCTIONS}
 """
+    else:
+        n = int(num_questions_if_no_guide or 16)
+        n = max(8, min(60, n))
+        user = f"""CONTEXTO:
+{contexto_sum}
+
+OBJETIVOS:
+{objetivos_sum}
+
+NO hay guía cargada. Debes:
+- Generar EXACTAMENTE {n} preguntas totales (ni más ni menos), claras, neutrales y accionables.
+- Estructurarlas en capítulos con 2–3 subcapítulos por capítulo.
+- Seguir el flujo analítico: contexto → prácticas/experiencias → motivadores/tensiones → producto/servicio → barreras → oportunidades → cierre.
+- No dejes preguntas al nivel del capítulo. Todas deben ir en subcapítulos.
+- Devuelve SOLO el JSON pedido.
+
+{MATRIX_INSTRUCTIONS}
+"""
+
     try:
-        raw = llm.chat_json(sys, user)
+        raw = llm.chat_json(sys, user, temperature=0.1)
         return safe_json_loads(raw)
     except Exception:
-        raw = llm.chat(sys, user)
+        raw = llm.chat(sys, user, temperature=0.1)
         return safe_json_loads(raw)
 
 
 # =====================================================
-# NORMALIZACIÓN DE ESTRUCTURA
+# NORMALIZACIÓN + DATAFRAME
 # =====================================================
 def _question_to_str(x: Any) -> str:
     if x is None:
@@ -253,20 +278,20 @@ def _question_to_str(x: Any) -> str:
         return str(x)
     return str(x).strip()
 
-def _distribute(lst: List[str], parts: int) -> List[List[str]]:
-    n = max(1, parts)
-    size = (len(lst) + n - 1) // n
-    return [lst[i:i+size] for i in range(0, len(lst), size)]
-
 def normalize_matrix_structure(matrix: Dict[str, Any], preguntas: List[str]) -> Dict[str, Any]:
     caps = matrix.get("capitulos") or []
     if not caps:
-        # crear estructura desde preguntas
-        parts_caps = _distribute(preguntas, 3)
+        # fallback simple si el modelo devolvió vacío
+        parts = 3
+        size = (len(preguntas) + parts - 1) // parts if preguntas else 5
         caps = []
-        for i, cap_q in enumerate(parts_caps, start=1):
-            subs = [{"titulo": f"Bloque {j+1}", "preguntas": cap_q[j::3]} for j in range(3)]
-            caps.append({"titulo": f"Capítulo {i}", "subcapitulos": subs})
+        for i in range(parts):
+            chunk = preguntas[i*size:(i+1)*size] if preguntas else []
+            subs = [
+                {"titulo": "Bloque 1", "preguntas": chunk[0::2]},
+                {"titulo": "Bloque 2", "preguntas": chunk[1::2]},
+            ]
+            caps.append({"titulo": f"Capítulo {i+1}", "subcapitulos": subs})
         matrix["capitulos"] = caps
 
     new_caps = []
@@ -274,7 +299,16 @@ def normalize_matrix_structure(matrix: Dict[str, Any], preguntas: List[str]) -> 
         ctitle = (cap.get("titulo") or "").strip() or f"Capítulo {i}"
         subs = cap.get("subcapitulos") or []
         if not subs:
-            subs = [{"titulo": f"Bloque 1", "preguntas": []}, {"titulo": f"Bloque 2", "preguntas": []}]
+            subs = [{"titulo": "Bloque 1", "preguntas": []}, {"titulo": "Bloque 2", "preguntas": []}]
+        # Garantizar 2–3 subcapítulos
+        if len(subs) == 1:
+            subs.append({"titulo": f"{subs[0].get('titulo','Bloque')} · Parte 2", "preguntas": []})
+        elif len(subs) > 3:
+            merged = {"titulo": f"{subs[2].get('titulo','Bloque')} · Combinado", "preguntas": []}
+            for s in subs[2:]:
+                merged["preguntas"].extend(s.get("preguntas") or [])
+            subs = subs[:2] + [merged]
+
         norm_subs = []
         for j, s in enumerate(subs, start=1):
             stitle = (s.get("titulo") or "").strip() or f"Bloque {j}"
@@ -284,7 +318,6 @@ def normalize_matrix_structure(matrix: Dict[str, Any], preguntas: List[str]) -> 
         new_caps.append({"titulo": ctitle, "subcapitulos": norm_subs})
     matrix["capitulos"] = new_caps
     return matrix
-
 
 def to_dataframe(matrix: Dict[str, Any]) -> pd.DataFrame:
     rows = []
@@ -307,6 +340,7 @@ async def generate_matrix(
     guia: Optional[UploadFile] = File(None),
     filename_base: Optional[str] = Form("matriz.xlsx"),
     openai_api_key: Optional[str] = Form(None),
+    num_questions: Optional[int] = Form(None),   # si no hay guía
 ):
     try:
         contexto_bytes = await contexto.read()
@@ -318,23 +352,33 @@ async def generate_matrix(
         ctx_text = extract_text_from_pdf_bytes(contexto_bytes)
         obj_text = extract_text_from_pdf_bytes(objetivos_bytes)
 
-        # Detectar preguntas
         preguntas = extract_questions_from_text_v3(extract_text_from_pdf_bytes(guia_bytes)) if guia_bytes else []
-        print(f"Preguntas detectadas: {len(preguntas)}")
 
-        # Construcción
-        matrix = build_matrix_with_llm(llm, ctx_text, obj_text, preguntas)
-        matrix = normalize_matrix_structure(matrix, preguntas)
+        matrix = build_matrix_with_llm(
+            llm,
+            ctx_text,
+            obj_text,
+            preguntas if preguntas else None,
+            num_questions_if_no_guide=num_questions
+        )
+        matrix = normalize_matrix_structure(matrix, preguntas if preguntas else [])
         df = to_dataframe(matrix)
+        if df.empty:
+            raise RuntimeError("La matriz resultó vacía.")
 
         # Exportar Excel
         buf = io.BytesIO()
-        df.to_excel(buf, index=False)
+        df.to_excel(buf, index=False, engine="openpyxl")
         buf.seek(0)
 
         token = generate_token()
         exp = datetime.utcnow() + timedelta(minutes=TOKEN_EXPIRATION_MINUTES)
-        DOWNLOADS[token] = (buf.getvalue(), filename_base or "matriz.xlsx", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", exp)
+        DOWNLOADS[token] = (
+            buf.getvalue(),
+            filename_base or "matriz.xlsx",
+            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            exp,
+        )
 
         cleanup_downloads()
         download_url = f"/download/{token}"
