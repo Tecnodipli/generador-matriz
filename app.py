@@ -2,6 +2,8 @@ import os
 import io
 import re
 import json
+import unicodedata
+import math
 import pdfplumber
 import pandas as pd
 from datetime import datetime, timedelta
@@ -18,8 +20,9 @@ try:
 except Exception:
     OpenAI = None
 
+
 # =====================================================
-# CONFIG
+# CONFIGURACIÓN BASE
 # =====================================================
 load_dotenv()
 app = FastAPI(title="Generador de Matrices - Dipli")
@@ -45,17 +48,19 @@ TOKEN_EXPIRATION_MINUTES = 30
 
 
 # =====================================================
-# UTILS
+# UTILIDADES
 # =====================================================
 def cleanup_downloads():
     now = datetime.utcnow()
-    expired = [k for k, v in DOWNLOADS.items() if v[3] <= now]
-    for k in expired:
-        DOWNLOADS.pop(k, None)
+    for k, v in list(DOWNLOADS.items()):
+        if v[3] <= now:
+            DOWNLOADS.pop(k, None)
+
 
 def generate_token() -> str:
     import secrets
     return secrets.token_urlsafe(16)
+
 
 def extract_text_from_pdf_bytes(file_bytes: bytes) -> str:
     texts = []
@@ -67,7 +72,7 @@ def extract_text_from_pdf_bytes(file_bytes: bytes) -> str:
 
 
 # =====================================================
-# LLM CLIENT (con conteo real de tokens)
+# CLIENTE OPENAI (cuenta tokens)
 # =====================================================
 class LLMClient:
     def __init__(self, model: str = "gpt-4o-mini", api_key: Optional[str] = None):
@@ -94,16 +99,6 @@ class LLMClient:
             pass
 
     @retry(stop=stop_after_attempt(3), wait=wait_exponential_jitter(1, 6))
-    def chat(self, system: str, user: str, temperature: float = 0.1) -> str:
-        resp = self.client.chat.completions.create(
-            model=self.model,
-            messages=[{"role": "system", "content": system}, {"role": "user", "content": user}],
-            temperature=temperature,
-        )
-        self._accumulate_usage(resp)
-        return resp.choices[0].message.content
-
-    @retry(stop=stop_after_attempt(3), wait=wait_exponential_jitter(1, 6))
     def chat_json(self, system: str, user: str, temperature: float = 0.1) -> str:
         resp = self.client.chat.completions.create(
             model=self.model,
@@ -116,84 +111,161 @@ class LLMClient:
 
 
 # =====================================================
-# EXTRACCIÓN DE PREGUNTAS (INTELIGENTE)
+# EXTRACTOR DE PREGUNTAS (v5 CONFIGURABLE)
 # =====================================================
-_INTERROGATIVOS = (
-    r"(qué|como|cómo|cual|cuál|cuando|cuándo|donde|dónde|quien|quién|por qué|para qué|cuanto|cuánto|cuales|cuáles)"
-)
+def _load_list_env(key: str, base: list[str]) -> list[str]:
+    raw = os.getenv(key, "")
+    if not raw.strip():
+        return base
+    extra = [t.strip() for t in raw.split(",") if t.strip()]
+    return list(dict.fromkeys(base + extra))
 
-def _clean_line(s: str) -> str:
-    s = s.strip("•-· ").strip()
-    s = re.sub(r"\s+", " ", s)
-    return s
+IMPERATIVOS_BASE = [
+    "cuéntame","cuentame","háblame","hablame","dime","menciona","explícame","explicame",
+    "relata","descríbeme","describeme","indique","indica","mencione","narre",
+    "explique","detalla","detalle","describe","comparte","piensa","recuerda","cuenta",
+    "comente","profundice","aclare","justifique","argumente","enumere","motive",
+]
+INSTRUCCIONES_BASE = [
+    "DILIGENCIAR","LEA","ACLAR","MOSTRAR","ROTACIÓN","APLICAR","GRABACIÓN","GRABACION",
+    "CUESTIONARIO","MANTENGA VISIBLE","NO LEER","LEER","MUESTRE","ENTREGUE","PROYECTE",
+    "PASE A","CAMBIE A","LEA EN VOZ ALTA",
+]
+MOD_TAGS_BASE = ["ENT.","MOD.","ENTREVISTADOR","FACILITADOR","GUIA"]
 
-def _is_questionish(s: str) -> bool:
-    if "?" in s or "¿" in s:
-        return True
-    if re.match(rf"^\s*{_INTERROGATIVOS}\b", s, re.IGNORECASE):
-        return True
-    if re.match(r"^\s*(cuéntame|háblame|dime|menciona|explícame|relata|descríbeme|cómo fue|qué pasó|qué sintió|qué pensó|por favor cuéntame)", s, re.IGNORECASE):
-        return True
-    if re.match(r"^\s*(piensa|recuerda|comparte|cuenta|mencione|narre|indique|explique|detalla|describe)", s, re.IGNORECASE):
-        return True
-    return False
+IMPERATIVOS = _load_list_env("EXTRACTOR_IMPERATIVOS", IMPERATIVOS_BASE)
+INSTRUCCIONES = _load_list_env("EXTRACTOR_INSTRUCCIONES", INSTRUCCIONES_BASE)
+MOD_TAGS = _load_list_env("EXTRACTOR_MOD_TAGS", MOD_TAGS_BASE)
 
-def extract_questions_from_text_v3(text: str) -> List[str]:
+_INTERROGATIVOS_RE = r"(qué|como|cómo|cual|cuál|cuando|cuándo|donde|dónde|quien|quién|por qué|para qué|cuanto|cuánto|cuales|cuáles)"
+_IMPERATIVOS_RE = r"(" + "|".join(re.escape(v) for v in IMPERATIVOS) + r")"
+_HEADER_LINE = re.compile(r"^[A-ZÁÉÍÓÚÑ0-9\s\-\(\)\/\#\.\:]+$")
+_MODERATOR_TAG = re.compile(r"^\s*\(?\s*(?:" + "|".join(re.escape(t) for t in MOD_TAGS) + r")", re.IGNORECASE)
+_ONLY_INSTRUCTION = re.compile(r"(" + "|".join(re.escape(v) for v in INSTRUCCIONES) + r")", re.IGNORECASE)
+
+def _strip_bullets(s: str) -> str:
+    s = re.sub(r"^\s*([•●○\-–—]|(\d+[\.\)]|[a-zA-Z][\.\)]))\s*", "", s or "")
+    return s.strip()
+
+def _normalize_spaces(s: str) -> str:
+    return re.sub(r"\s+", " ", s or "").strip()
+
+def _casefold(s: str) -> str:
+    return unicodedata.normalize("NFKC", (s or "")).casefold().strip()
+
+def _looks_like_header(line: str) -> bool:
+    txt = line.strip()
+    if len(txt) <= 2:
+        return False
+    return bool(_HEADER_LINE.match(txt)) and "?" not in txt and "¿" not in txt
+
+def _is_questionish_start(line: str) -> bool:
+    cf = _casefold(line)
+    return (
+        re.match(rf"^\s*{_INTERROGATIVOS_RE}\b", cf)
+        or re.match(rf"^\s*{_IMPERATIVOS_RE}\b", cf)
+    )
+
+def _has_any_question(line: str) -> bool:
+    cf = _casefold(line)
+    return ("?" in line or "¿" in line
+            or re.search(rf"\b{_INTERROGATIVOS_RE}\b", cf)
+            or re.match(rf"^\s*{_IMPERATIVOS_RE}\b", cf))
+
+def segment_questions_from_line(line: str) -> List[str]:
+    parts = []
+    segments = re.split(r"(¿[^?]*\?)", line)
+    for seg in segments:
+        seg = _normalize_spaces(seg)
+        if not seg:
+            continue
+        if seg.startswith("¿") and seg.endswith("?"):
+            parts.append(seg)
+        else:
+            if _is_questionish_start(seg):
+                if not seg.endswith("?"):
+                    seg += "?"
+                parts.append(seg)
+    return [_strip_bullets(p) for p in parts if len(p) > 3]
+
+def extract_questions_from_text_v5(text: str) -> List[str]:
     if not text:
         return []
-    lines = [_clean_line(l) for l in text.splitlines() if l.strip()]
-    candidates = []
-    buffer = []
-    for l in lines:
-        if _is_questionish(l):
-            if buffer:
-                candidates.append(" ".join(buffer))
-                buffer = []
-            buffer.append(l)
-        elif buffer:
-            if len(l.split()) < 20 and not re.match(r"^[A-ZÁÉÍÓÚÑ]{2,}$", l):
-                buffer.append(l)
-            else:
-                candidates.append(" ".join(buffer))
-                buffer = []
-    if buffer:
-        candidates.append(" ".join(buffer))
-    seen = set()
-    out = []
-    for q in candidates:
-        q = q.strip()
-        if len(q) < 4:
-            continue
-        norm = re.sub(r"[\W_]+", "", q.lower())
-        if norm not in seen:
-            seen.add(norm)
-            if not q.endswith("?"):
-                q += "?"
+    lines = [_strip_bullets(l) for l in text.splitlines()]
+    lines = [l for l in lines if _normalize_spaces(l)]
+    preguntas, buffer = [], []
+
+    def flush():
+        if not buffer:
+            return
+        merged = _normalize_spaces(" ".join(buffer))
+        segs = segment_questions_from_line(merged)
+        if not segs and _has_any_question(merged):
+            if not merged.endswith("?"):
+                merged += "?"
+            segs = [merged]
+        preguntas.extend(segs)
+        buffer.clear()
+
+    i = 0
+    while i < len(lines):
+        ln = _normalize_spaces(lines[i])
+        if _looks_like_header(ln):
+            flush(); i += 1; continue
+        if _MODERATOR_TAG.match(ln):
+            if _ONLY_INSTRUCTION.search(ln) and not _has_any_question(ln):
+                flush(); i += 1; continue
+            if _has_any_question(ln):
+                flush()
+                preguntas.extend(segment_questions_from_line(ln))
+                i += 1; continue
+        if re.search(r"¿[^?]*\?", ln):
+            flush()
+            preguntas.extend(segment_questions_from_line(ln))
+            i += 1; continue
+        if _is_questionish_start(ln):
+            flush(); buffer.append(ln)
+            j = i + 1
+            while j < len(lines):
+                nxt = _normalize_spaces(lines[j])
+                if not nxt or _looks_like_header(nxt) or re.search(r"¿[^?]*\?", nxt) or _is_questionish_start(nxt):
+                    break
+                if _ONLY_INSTRUCTION.search(nxt) and not _has_any_question(nxt):
+                    break
+                buffer.append(nxt); j += 1
+            flush(); i = j; continue
+        if buffer:
+            nxt = ln
+            if not (_looks_like_header(nxt) or _MODERATOR_TAG.match(nxt)):
+                if not _ONLY_INSTRUCTION.search(nxt) or _has_any_question(nxt):
+                    buffer.append(nxt); i += 1; continue
+        i += 1
+    flush()
+
+    # Deduplicar (sin perder contenido)
+    seen, out = set(), []
+    for q in preguntas:
+        key = re.sub(r"[\W_]+", "", _casefold(q))
+        if key not in seen:
+            seen.add(key)
             out.append(q)
     return out
 
 
 # =====================================================
-# CONSTRUCCIÓN DE MATRIZ (LLM)
+# GENERACIÓN DE MATRIZ (estructura y reparto exacto)
 # =====================================================
-MATRIX_INSTRUCTIONS = """
-Devuelve un JSON válido con esta estructura EXACTA:
+STRUCTURE_ONLY_INSTRUCTIONS = """
+Devuelve SOLO títulos, sin preguntas. Estructura:
 {
-  "capitulos": [
-    {
-      "titulo": "string",
-      "subcapitulos": [
-        { "titulo": "string", "preguntas": ["string", ...] }
-      ]
-    }
-  ]
+ "capitulos":[
+   {"titulo":"string","subcapitulos":[{"titulo":"string"}, {"titulo":"string"}]}
+ ]
 }
-
 Reglas:
-- Cada capítulo debe tener 2–3 subcapítulos.
-- No dejes preguntas a nivel del capítulo (siempre dentro de "subcapitulos").
-- "preguntas" debe ser SIEMPRE un array de strings (nunca objetos).
-- Mantén orden lógico y títulos breves y consistentes.
+- 2–3 subcapítulos por capítulo.
+- Títulos claros y breves.
+- No incluyas campo "preguntas".
 """
 
 def safe_json_loads(s: str) -> Dict[str, Any]:
@@ -208,125 +280,106 @@ def safe_json_loads(s: str) -> Dict[str, Any]:
             return json.loads(match.group(0))
         raise ValueError("No se pudo parsear JSON.")
 
-def build_matrix_with_llm(
-    llm: LLMClient,
-    contexto_sum: str,
-    objetivos_sum: str,
-    preguntas: Optional[List[str]],
-    num_questions_if_no_guide: Optional[int] = None
-) -> Dict[str, Any]:
-    """
-    Si 'preguntas' llega vacío, el LLM debe generar EXACTAMENTE 'num_questions_if_no_guide'
-    preguntas (por defecto 16). Devuelve matriz con capítulos y 2–3 subcapítulos.
-    """
-    sys = "Eres un Research Lead experto en investigación cualitativa."
-
-    if preguntas:
-        pregunta_blob = "\n".join(f"- {p}" for p in preguntas)
-        user = f"""CONTEXTO:
+def build_structure_with_llm(llm: LLMClient, contexto_sum: str, objetivos_sum: str) -> Dict[str, Any]:
+    sys = "Eres Research Lead experto en investigación cualitativa."
+    user = f"""CONTEXTO:
 {contexto_sum}
 
 OBJETIVOS:
 {objetivos_sum}
 
-PREGUNTAS DE LA GUÍA (inclúyelas TODAS, sin editar):
-{pregunta_blob}
-
-{MATRIX_INSTRUCTIONS}
+{STRUCTURE_ONLY_INSTRUCTIONS}
 """
-    else:
-        n = int(num_questions_if_no_guide or 16)
-        n = max(8, min(60, n))
-        user = f"""CONTEXTO:
-{contexto_sum}
+    raw = llm.chat_json(sys, user, temperature=0.1)
+    return safe_json_loads(raw)
 
-OBJETIVOS:
-{objetivos_sum}
-
-NO hay guía cargada. Debes:
-- Generar EXACTAMENTE {n} preguntas totales (ni más ni menos), claras, neutrales y accionables.
-- Estructurarlas en capítulos con 2–3 subcapítulos por capítulo.
-- Seguir el flujo analítico: contexto → prácticas/experiencias → motivadores/tensiones → producto/servicio → barreras → oportunidades → cierre.
-- No dejes preguntas al nivel del capítulo. Todas deben ir en subcapítulos.
-- Devuelve SOLO el JSON pedido.
-
-{MATRIX_INSTRUCTIONS}
-"""
-
-    try:
-        raw = llm.chat_json(sys, user, temperature=0.1)
-        return safe_json_loads(raw)
-    except Exception:
-        raw = llm.chat(sys, user, temperature=0.1)
-        return safe_json_loads(raw)
-
-
-# =====================================================
-# NORMALIZACIÓN + DATAFRAME
-# =====================================================
-def _question_to_str(x: Any) -> str:
-    if x is None:
-        return ""
-    if isinstance(x, str):
-        return x.strip()
-    if isinstance(x, (list, tuple)):
-        return " ".join(str(t).strip() for t in x if str(t).strip())
-    if isinstance(x, dict):
-        for k in ("pregunta", "question", "texto", "text", "q", "enunciado"):
-            if k in x and isinstance(x[k], (str, list, tuple)):
-                return _question_to_str(x[k])
-        return str(x)
-    return str(x).strip()
-
-def normalize_matrix_structure(matrix: Dict[str, Any], preguntas: List[str]) -> Dict[str, Any]:
-    caps = matrix.get("capitulos") or []
+def ensure_2_3_subchap_per_chapter(struct: Dict[str, Any]) -> Dict[str, Any]:
+    caps = struct.get("capitulos") or []
     if not caps:
-        # fallback simple si el modelo devolvió vacío
-        parts = 3
-        size = (len(preguntas) + parts - 1) // parts if preguntas else 5
-        caps = []
-        for i in range(parts):
-            chunk = preguntas[i*size:(i+1)*size] if preguntas else []
-            subs = [
-                {"titulo": "Bloque 1", "preguntas": chunk[0::2]},
-                {"titulo": "Bloque 2", "preguntas": chunk[1::2]},
-            ]
-            caps.append({"titulo": f"Capítulo {i+1}", "subcapitulos": subs})
-        matrix["capitulos"] = caps
-
-    new_caps = []
-    for i, cap in enumerate(caps, start=1):
-        ctitle = (cap.get("titulo") or "").strip() or f"Capítulo {i}"
+        caps = [{"titulo": "Capítulo 1", "subcapitulos": [{"titulo": "Bloque 1"}, {"titulo": "Bloque 2"}]}]
+    fixed = []
+    for idx, cap in enumerate(caps, start=1):
+        ctitle = (cap.get("titulo") or "").strip() or f"Capítulo {idx}"
         subs = cap.get("subcapitulos") or []
-        if not subs:
-            subs = [{"titulo": "Bloque 1", "preguntas": []}, {"titulo": "Bloque 2", "preguntas": []}]
-        # Garantizar 2–3 subcapítulos
-        if len(subs) == 1:
-            subs.append({"titulo": f"{subs[0].get('titulo','Bloque')} · Parte 2", "preguntas": []})
-        elif len(subs) > 3:
-            merged = {"titulo": f"{subs[2].get('titulo','Bloque')} · Combinado", "preguntas": []}
-            for s in subs[2:]:
-                merged["preguntas"].extend(s.get("preguntas") or [])
-            subs = subs[:2] + [merged]
+        subs = [{"titulo": (s.get("titulo") or "").strip() or f"Bloque {i+1}"} for i, s in enumerate(subs)]
+        if len(subs) < 2:
+            subs = subs + [{"titulo": f"Bloque {len(subs)+1}"}]
+        if len(subs) > 3:
+            subs = subs[:3]
+        fixed.append({"titulo": ctitle, "subcapitulos": subs})
+    struct["capitulos"] = fixed
+    return struct
 
-        norm_subs = []
-        for j, s in enumerate(subs, start=1):
-            stitle = (s.get("titulo") or "").strip() or f"Bloque {j}"
-            qraw = s.get("preguntas") or []
-            qlist = [_question_to_str(q) for q in qraw if _question_to_str(q)]
-            norm_subs.append({"titulo": stitle, "preguntas": qlist})
-        new_caps.append({"titulo": ctitle, "subcapitulos": norm_subs})
-    matrix["capitulos"] = new_caps
-    return matrix
+def build_default_structure(preguntas_count: int) -> Dict[str, Any]:
+    # Estructura base si no usamos LLM (backup robusto)
+    # Capítulos aproximados: 3–5 según tamaño
+    if preguntas_count <= 12:
+        num_chapters = 3
+        subs_per_ch = 2
+    elif preguntas_count <= 30:
+        num_chapters = 3
+        subs_per_ch = 3
+    else:
+        num_chapters = min(5, math.ceil(preguntas_count / 15))
+        subs_per_ch = 3
+    caps = []
+    for i in range(num_chapters):
+        subs = [{"titulo": f"Bloque {j+1}"} for j in range(subs_per_ch)]
+        caps.append({"titulo": f"Capítulo {i+1}", "subcapitulos": subs})
+    return {"capitulos": caps}
+
+def distribute_questions_exact(preguntas: List[str], struct: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Reparte TODAS las preguntas preservando el orden, balanceadas
+    entre los subcapítulos de cada capítulo. No crea ni elimina preguntas.
+    """
+    caps = struct.get("capitulos") or []
+    if not caps:
+        struct = build_default_structure(len(preguntas))
+        caps = struct["capitulos"]
+
+    # Recolectar slots de subcapítulos
+    sub_refs = []
+    for cap in caps:
+        subs = cap.get("subcapitulos") or []
+        # asegurar 2–3 subs
+        if len(subs) < 2:
+            subs += [{"titulo": f"Bloque {len(subs)+1}"}]
+        if len(subs) > 3:
+            subs = subs[:3]
+        cap["subcapitulos"] = [{"titulo": s.get("titulo","Bloque").strip() or "Bloque", "preguntas": []} for s in subs]
+        for s in cap["subcapitulos"]:
+            sub_refs.append(s)
+
+    if not sub_refs:
+        struct = build_default_structure(len(preguntas))
+        sub_refs = []
+        for cap in struct["capitulos"]:
+            for s in cap["subcapitulos"]:
+                s["preguntas"] = []
+                sub_refs.append(s)
+
+    # Distribución balanceada preservando orden
+    total_subs = len(sub_refs)
+    if total_subs == 0:
+        # estructura mínima de seguridad
+        struct = {"capitulos":[{"titulo":"Capítulo 1","subcapitulos":[{"titulo":"Bloque 1","preguntas":[]} ,{"titulo":"Bloque 2","preguntas":[]}]}]}
+        sub_refs = struct["capitulos"][0]["subcapitulos"]
+        total_subs = len(sub_refs)
+
+    for idx, q in enumerate(preguntas):
+        sub_refs[idx % total_subs]["preguntas"].append(q)
+
+    return struct
 
 def to_dataframe(matrix: Dict[str, Any]) -> pd.DataFrame:
     rows = []
-    for ci, cap in enumerate(matrix.get("capitulos", []), start=1):
-        ctitle = (cap.get("titulo") or "").strip() or f"Capítulo {ci}"
-        for si, sub in enumerate(cap.get("subcapitulos") or [], start=1):
-            stitle = (sub.get("titulo") or "").strip() or f"Bloque {si}"
-            for q in sub.get("preguntas") or []:
-                rows.append({"Capitulo": ctitle, "Subcapitulo": stitle, "Preguntas": _question_to_str(q)})
+    for cap in matrix.get("capitulos", []):
+        cap_title = cap.get("titulo", "")
+        for sub in cap.get("subcapitulos", []):
+            sub_title = sub.get("titulo", "")
+            for q in sub.get("preguntas", []):
+                rows.append({"Capitulo": cap_title, "Subcapitulo": sub_title, "Preguntas": q})
     return pd.DataFrame(rows, columns=["Capitulo", "Subcapitulo", "Preguntas"])
 
 
@@ -340,63 +393,125 @@ async def generate_matrix(
     guia: Optional[UploadFile] = File(None),
     filename_base: Optional[str] = Form("matriz.xlsx"),
     openai_api_key: Optional[str] = Form(None),
-    num_questions: Optional[int] = Form(None),   # si no hay guía
+    num_questions: Optional[int] = Form(None),
 ):
-    try:
-        contexto_bytes = await contexto.read()
-        objetivos_bytes = await objetivos.read()
-        guia_bytes = await guia.read() if guia else None
+    contexto_bytes = await contexto.read()
+    objetivos_bytes = await objetivos.read()
+    guia_bytes = await guia.read() if guia else None
 
-        llm = LLMClient(api_key=openai_api_key)
+    llm = LLMClient(api_key=openai_api_key)
+    ctx_text = extract_text_from_pdf_bytes(contexto_bytes)
+    obj_text = extract_text_from_pdf_bytes(objetivos_bytes)
 
-        ctx_text = extract_text_from_pdf_bytes(contexto_bytes)
-        obj_text = extract_text_from_pdf_bytes(objetivos_bytes)
+    if guia_bytes:
+        # 1) Extraer TODAS las preguntas
+        preguntas = extract_questions_from_text_v5(extract_text_from_pdf_bytes(guia_bytes))
+        # 2) Pedir SOLO estructura (títulos) al LLM
+        try:
+            structure = build_structure_with_llm(llm, ctx_text, obj_text)
+            structure = ensure_2_3_subchap_per_chapter(structure)
+        except Exception:
+            structure = build_default_structure(len(preguntas))
+        # 3) Repartir determinísticamente TODAS las preguntas
+        matrix = distribute_questions_exact(preguntas, structure)
 
-        preguntas = extract_questions_from_text_v3(extract_text_from_pdf_bytes(guia_bytes)) if guia_bytes else []
-
-        matrix = build_matrix_with_llm(
-            llm,
-            ctx_text,
-            obj_text,
-            preguntas if preguntas else None,
-            num_questions_if_no_guide=num_questions
-        )
-        matrix = normalize_matrix_structure(matrix, preguntas if preguntas else [])
+        # Validación dura: asegurar conteo exacto
         df = to_dataframe(matrix)
-        if df.empty:
-            raise RuntimeError("La matriz resultó vacía.")
+        if len(df) != len(preguntas):
+            # Si por alguna razón faltan, completar en el último subcapítulo
+            assigned = [row["Preguntas"] for _, row in df.iterrows()]
+            assigned_norm = set(re.sub(r"\s+", " ", a).strip() for a in assigned)
+            missing = [p for p in preguntas if re.sub(r"\s+", " ", p).strip() not in assigned_norm]
+            if missing:
+                # empujar al último subcapítulo existente
+                last_sub = None
+                if matrix.get("capitulos") and matrix["capitulos"][-1].get("subcapitulos"):
+                    last_sub = matrix["capitulos"][-1]["subcapitulos"][-1]
+                if last_sub is None:
+                    matrix = build_default_structure(len(preguntas))
+                    last_sub = matrix["capitulos"][-1]["subcapitulos"][-1]
+                last_sub.setdefault("preguntas", []).extend(missing)
+                df = to_dataframe(matrix)
+                # asegurar igualdad final
+                if len(df) != len(preguntas):
+                    raise RuntimeError("No se pudo igualar exactamente el total de preguntas.")
+    else:
+        # Sin guía: el LLM genera preguntas y estructura completa
+        n = int(num_questions or 16)
+        n = max(8, min(60, n))
+        # Pedimos estructura primero
+        try:
+            structure = build_structure_with_llm(llm, ctx_text, obj_text)
+            structure = ensure_2_3_subchap_per_chapter(structure)
+        except Exception:
+            structure = build_default_structure(n)
 
-        # Exportar Excel
-        buf = io.BytesIO()
-        df.to_excel(buf, index=False, engine="openpyxl")
-        buf.seek(0)
+        # Pedimos al LLM que genere EXACTAMENTE n preguntas (texto libre)
+        sys = "Eres Research Lead. Generas preguntas claras y neutrales para una guía de entrevista."
+        user = f"""CONTEXTO:
+{ctx_text}
 
-        token = generate_token()
-        exp = datetime.utcnow() + timedelta(minutes=TOKEN_EXPIRATION_MINUTES)
-        DOWNLOADS[token] = (
-            buf.getvalue(),
-            filename_base or "matriz.xlsx",
-            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            exp,
-        )
+OBJETIVOS:
+{obj_text}
 
-        cleanup_downloads()
-        download_url = f"/download/{token}"
+Genera exactamente {n} preguntas (ni más ni menos), en estilo cualitativo.
+Devuelve JSON: {{"preguntas": ["..."]}} sin texto adicional.
+"""
+        try:
+            raw = llm.chat_json(sys, user, temperature=0.2)
+            data = safe_json_loads(raw)
+            gen_q = data.get("preguntas") or []
+            # normalizar
+            preguntas = [str(x).strip() if isinstance(x, str) else str(x) for x in gen_q]
+            preguntas = [q if q.endswith("?") else q + "?" for q in preguntas]
+        except Exception:
+            # fallback simple
+            preguntas = [f"Pregunta {i+1}?" for i in range(n)]
 
-        return JSONResponse({
-            "status": "ok",
-            "download_url": download_url,
-            "filename": filename_base,
-            "detected_questions": len(preguntas),
-            "tokens": {
-                "total": llm.total_tokens,
-                "prompt": llm.prompt_tokens,
-                "completion": llm.completion_tokens
-            },
-            "expires_in_minutes": TOKEN_EXPIRATION_MINUTES
-        })
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        # Repartir EXACTO n
+        preguntas = preguntas[:n]
+        matrix = distribute_questions_exact(preguntas, structure)
+        df = to_dataframe(matrix)
+        if len(df) != n:
+            # llenar faltantes si ocurriera
+            assigned = [row["Preguntas"] for _, row in df.iterrows()]
+            assigned_norm = set(re.sub(r"\s+", " ", a).strip() for a in assigned)
+            missing = [p for p in preguntas if re.sub(r"\s+", " ", p).strip() not in assigned_norm]
+            if missing:
+                last_sub = matrix["capitulos"][-1]["subcapitulos"][-1]
+                last_sub.setdefault("preguntas", []).extend(missing)
+                df = to_dataframe(matrix)
+                if len(df) != n:
+                    raise RuntimeError("No se pudo igualar exactamente el total de preguntas generadas.")
+
+    # Exportar Excel
+    buf = io.BytesIO()
+    df.to_excel(buf, index=False, engine="openpyxl")
+    buf.seek(0)
+
+    # Nombre forzado .xlsx
+    safe_name = (filename_base or "matriz.xlsx").strip()
+    safe_name = re.sub(r'[\\/:*?"<>|]+', "_", safe_name)
+    if not safe_name.lower().endswith(".xlsx"):
+        safe_name += ".xlsx"
+
+    token = generate_token()
+    exp = datetime.utcnow() + timedelta(minutes=TOKEN_EXPIRATION_MINUTES)
+    DOWNLOADS[token] = (buf.getvalue(), safe_name,
+        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", exp)
+    cleanup_downloads()
+
+    return JSONResponse({
+        "status": "ok",
+        "download_url": f"/download/{token}",
+        "filename": safe_name,
+        "detected_questions": len(df),  # ahora exactamente igual a preguntas guía (si hubo guía)
+        "tokens": {
+            "total": llm.total_tokens,
+            "prompt": llm.prompt_tokens,
+            "completion": llm.completion_tokens
+        },
+    })
 
 
 # =====================================================
