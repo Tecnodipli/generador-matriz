@@ -242,7 +242,6 @@ def extract_questions_from_text_v5(text: str) -> List[str]:
         i += 1
     flush()
 
-    # Deduplicar (sin perder contenido)
     seen, out = set(), []
     for q in preguntas:
         key = re.sub(r"[\W_]+", "", _casefold(q))
@@ -280,6 +279,26 @@ def safe_json_loads(s: str) -> Dict[str, Any]:
             return json.loads(match.group(0))
         raise ValueError("No se pudo parsear JSON.")
 
+def ensure_titles(struct: Dict[str, Any]) -> Dict[str, Any]:
+    """Asegura títulos no vacíos en capítulos y subcapítulos."""
+    caps = struct.get("capitulos") or []
+    if not caps:
+        struct["capitulos"] = [{"titulo": "Capítulo 1", "subcapitulos": [{"titulo": "Bloque 1"}, {"titulo": "Bloque 2"}]}]
+        return struct
+    fixed = []
+    for ci, cap in enumerate(caps, start=1):
+        ct = (cap.get("titulo") or "").strip() or f"Capítulo {ci}"
+        subs = cap.get("subcapitulos") or []
+        subs_fixed = []
+        if not subs:
+            subs = [{"titulo": "Bloque 1"}, {"titulo": "Bloque 2"}]
+        for si, sub in enumerate(subs, start=1):
+            st = (sub.get("titulo") or "").strip() or f"Bloque {si}"
+            subs_fixed.append({"titulo": st, **({k:v for k,v in sub.items() if k!='titulo'})})
+        fixed.append({"titulo": ct, "subcapitulos": subs_fixed})
+    struct["capitulos"] = fixed
+    return struct
+
 def build_structure_with_llm(llm: LLMClient, contexto_sum: str, objetivos_sum: str) -> Dict[str, Any]:
     sys = "Eres Research Lead experto en investigación cualitativa."
     user = f"""CONTEXTO:
@@ -291,12 +310,11 @@ OBJETIVOS:
 {STRUCTURE_ONLY_INSTRUCTIONS}
 """
     raw = llm.chat_json(sys, user, temperature=0.1)
-    return safe_json_loads(raw)
+    return ensure_titles(safe_json_loads(raw))
 
 def ensure_2_3_subchap_per_chapter(struct: Dict[str, Any]) -> Dict[str, Any]:
+    struct = ensure_titles(struct)
     caps = struct.get("capitulos") or []
-    if not caps:
-        caps = [{"titulo": "Capítulo 1", "subcapitulos": [{"titulo": "Bloque 1"}, {"titulo": "Bloque 2"}]}]
     fixed = []
     for idx, cap in enumerate(caps, start=1):
         ctitle = (cap.get("titulo") or "").strip() or f"Capítulo {idx}"
@@ -308,46 +326,34 @@ def ensure_2_3_subchap_per_chapter(struct: Dict[str, Any]) -> Dict[str, Any]:
             subs = subs[:3]
         fixed.append({"titulo": ctitle, "subcapitulos": subs})
     struct["capitulos"] = fixed
-    return struct
+    return ensure_titles(struct)
 
 def build_default_structure(preguntas_count: int) -> Dict[str, Any]:
-    # Estructura base si no usamos LLM (backup robusto)
-    # Capítulos aproximados: 3–5 según tamaño
     if preguntas_count <= 12:
-        num_chapters = 3
-        subs_per_ch = 2
+        num_chapters = 3; subs_per_ch = 2
     elif preguntas_count <= 30:
-        num_chapters = 3
-        subs_per_ch = 3
+        num_chapters = 3; subs_per_ch = 3
     else:
-        num_chapters = min(5, math.ceil(preguntas_count / 15))
-        subs_per_ch = 3
+        num_chapters = min(5, math.ceil(preguntas_count / 15)); subs_per_ch = 3
     caps = []
     for i in range(num_chapters):
         subs = [{"titulo": f"Bloque {j+1}"} for j in range(subs_per_ch)]
         caps.append({"titulo": f"Capítulo {i+1}", "subcapitulos": subs})
-    return {"capitulos": caps}
+    return ensure_titles({"capitulos": caps})
 
 def distribute_questions_exact(preguntas: List[str], struct: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    Reparte TODAS las preguntas preservando el orden, balanceadas
-    entre los subcapítulos de cada capítulo. No crea ni elimina preguntas.
-    """
+    struct = ensure_2_3_subchap_per_chapter(struct)
     caps = struct.get("capitulos") or []
-    if not caps:
-        struct = build_default_structure(len(preguntas))
-        caps = struct["capitulos"]
-
-    # Recolectar slots de subcapítulos
     sub_refs = []
     for cap in caps:
+        cap_title = (cap.get("titulo") or "").strip() or "Capítulo"
         subs = cap.get("subcapitulos") or []
-        # asegurar 2–3 subs
-        if len(subs) < 2:
-            subs += [{"titulo": f"Bloque {len(subs)+1}"}]
-        if len(subs) > 3:
-            subs = subs[:3]
-        cap["subcapitulos"] = [{"titulo": s.get("titulo","Bloque").strip() or "Bloque", "preguntas": []} for s in subs]
+        fixed_subs = []
+        for s in subs:
+            st = (s.get("titulo") or "").strip() or "Bloque"
+            fixed_subs.append({"titulo": st, "preguntas": []})
+        cap["titulo"] = cap_title
+        cap["subcapitulos"] = fixed_subs
         for s in cap["subcapitulos"]:
             sub_refs.append(s)
 
@@ -359,26 +365,21 @@ def distribute_questions_exact(preguntas: List[str], struct: Dict[str, Any]) -> 
                 s["preguntas"] = []
                 sub_refs.append(s)
 
-    # Distribución balanceada preservando orden
-    total_subs = len(sub_refs)
-    if total_subs == 0:
-        # estructura mínima de seguridad
-        struct = {"capitulos":[{"titulo":"Capítulo 1","subcapitulos":[{"titulo":"Bloque 1","preguntas":[]} ,{"titulo":"Bloque 2","preguntas":[]}]}]}
-        sub_refs = struct["capitulos"][0]["subcapitulos"]
-        total_subs = len(sub_refs)
-
+    total_subs = len(sub_refs) or 1
     for idx, q in enumerate(preguntas):
         sub_refs[idx % total_subs]["preguntas"].append(q)
 
-    return struct
+    return ensure_titles(struct)
 
 def to_dataframe(matrix: Dict[str, Any]) -> pd.DataFrame:
     rows = []
-    for cap in matrix.get("capitulos", []):
-        cap_title = cap.get("titulo", "")
-        for sub in cap.get("subcapitulos", []):
-            sub_title = sub.get("titulo", "")
-            for q in sub.get("preguntas", []):
+    caps = matrix.get("capitulos") or []
+    for ci, cap in enumerate(caps, start=1):
+        cap_title = (cap.get("titulo") or "").strip() or f"Capítulo {ci}"
+        subs = cap.get("subcapitulos") or []
+        for si, sub in enumerate(subs, start=1):
+            sub_title = (sub.get("titulo") or "").strip() or f"Bloque {si}"
+            for q in sub.get("preguntas") or []:
                 rows.append({"Capitulo": cap_title, "Subcapitulo": sub_title, "Preguntas": q})
     return pd.DataFrame(rows, columns=["Capitulo", "Subcapitulo", "Preguntas"])
 
@@ -404,26 +405,21 @@ async def generate_matrix(
     obj_text = extract_text_from_pdf_bytes(objetivos_bytes)
 
     if guia_bytes:
-        # 1) Extraer TODAS las preguntas
         preguntas = extract_questions_from_text_v5(extract_text_from_pdf_bytes(guia_bytes))
-        # 2) Pedir SOLO estructura (títulos) al LLM
+        # Estructura de títulos (sin preguntas)
         try:
             structure = build_structure_with_llm(llm, ctx_text, obj_text)
             structure = ensure_2_3_subchap_per_chapter(structure)
         except Exception:
             structure = build_default_structure(len(preguntas))
-        # 3) Repartir determinísticamente TODAS las preguntas
         matrix = distribute_questions_exact(preguntas, structure)
 
-        # Validación dura: asegurar conteo exacto
         df = to_dataframe(matrix)
         if len(df) != len(preguntas):
-            # Si por alguna razón faltan, completar en el último subcapítulo
             assigned = [row["Preguntas"] for _, row in df.iterrows()]
             assigned_norm = set(re.sub(r"\s+", " ", a).strip() for a in assigned)
             missing = [p for p in preguntas if re.sub(r"\s+", " ", p).strip() not in assigned_norm]
             if missing:
-                # empujar al último subcapítulo existente
                 last_sub = None
                 if matrix.get("capitulos") and matrix["capitulos"][-1].get("subcapitulos"):
                     last_sub = matrix["capitulos"][-1]["subcapitulos"][-1]
@@ -432,21 +428,18 @@ async def generate_matrix(
                     last_sub = matrix["capitulos"][-1]["subcapitulos"][-1]
                 last_sub.setdefault("preguntas", []).extend(missing)
                 df = to_dataframe(matrix)
-                # asegurar igualdad final
                 if len(df) != len(preguntas):
                     raise RuntimeError("No se pudo igualar exactamente el total de preguntas.")
     else:
-        # Sin guía: el LLM genera preguntas y estructura completa
+        # Sin guía: generar exactamente n preguntas + estructura
         n = int(num_questions or 16)
         n = max(8, min(60, n))
-        # Pedimos estructura primero
         try:
             structure = build_structure_with_llm(llm, ctx_text, obj_text)
             structure = ensure_2_3_subchap_per_chapter(structure)
         except Exception:
             structure = build_default_structure(n)
 
-        # Pedimos al LLM que genere EXACTAMENTE n preguntas (texto libre)
         sys = "Eres Research Lead. Generas preguntas claras y neutrales para una guía de entrevista."
         user = f"""CONTEXTO:
 {ctx_text}
@@ -461,19 +454,15 @@ Devuelve JSON: {{"preguntas": ["..."]}} sin texto adicional.
             raw = llm.chat_json(sys, user, temperature=0.2)
             data = safe_json_loads(raw)
             gen_q = data.get("preguntas") or []
-            # normalizar
             preguntas = [str(x).strip() if isinstance(x, str) else str(x) for x in gen_q]
             preguntas = [q if q.endswith("?") else q + "?" for q in preguntas]
         except Exception:
-            # fallback simple
             preguntas = [f"Pregunta {i+1}?" for i in range(n)]
 
-        # Repartir EXACTO n
         preguntas = preguntas[:n]
         matrix = distribute_questions_exact(preguntas, structure)
         df = to_dataframe(matrix)
         if len(df) != n:
-            # llenar faltantes si ocurriera
             assigned = [row["Preguntas"] for _, row in df.iterrows()]
             assigned_norm = set(re.sub(r"\s+", " ", a).strip() for a in assigned)
             missing = [p for p in preguntas if re.sub(r"\s+", " ", p).strip() not in assigned_norm]
@@ -505,7 +494,7 @@ Devuelve JSON: {{"preguntas": ["..."]}} sin texto adicional.
         "status": "ok",
         "download_url": f"/download/{token}",
         "filename": safe_name,
-        "detected_questions": len(df),  # ahora exactamente igual a preguntas guía (si hubo guía)
+        "detected_questions": len(df),  # filas en Excel
         "tokens": {
             "total": llm.total_tokens,
             "prompt": llm.prompt_tokens,
