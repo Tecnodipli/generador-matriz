@@ -25,7 +25,7 @@ except Exception:
 # CONFIGURACIÓN BASE
 # =====================================================
 load_dotenv()
-app = FastAPI(title="Generador de Matrices - Dipli")
+app = FastAPI(title="Generador de Matrices - Dipli (Semántico)")
 
 ALLOWED_ORIGINS = [
     "https://www.dipli.ai",
@@ -48,7 +48,7 @@ TOKEN_EXPIRATION_MINUTES = 30
 
 
 # =====================================================
-# UTILIDADES
+# UTILIDADES GENERALES
 # =====================================================
 def cleanup_downloads():
     now = datetime.utcnow()
@@ -216,13 +216,9 @@ def extract_questions_from_text_v5(text: str) -> List[str]:
             if _ONLY_INSTRUCTION.search(ln) and not _has_any_question(ln):
                 flush(); i += 1; continue
             if _has_any_question(ln):
-                flush()
-                preguntas.extend(segment_questions_from_line(ln))
-                i += 1; continue
+                flush(); preguntas.extend(segment_questions_from_line(ln)); i += 1; continue
         if re.search(r"¿[^?]*\?", ln):
-            flush()
-            preguntas.extend(segment_questions_from_line(ln))
-            i += 1; continue
+            flush(); preguntas.extend(segment_questions_from_line(ln)); i += 1; continue
         if _is_questionish_start(ln):
             flush(); buffer.append(ln)
             j = i + 1
@@ -246,27 +242,13 @@ def extract_questions_from_text_v5(text: str) -> List[str]:
     for q in preguntas:
         key = re.sub(r"[\W_]+", "", _casefold(q))
         if key not in seen:
-            seen.add(key)
-            out.append(q)
+            seen.add(key); out.append(q)
     return out
 
 
 # =====================================================
-# GENERACIÓN DE MATRIZ (estructura y reparto exacto)
+# UTILIDADES DE JSON/ESTRUCTURA
 # =====================================================
-STRUCTURE_ONLY_INSTRUCTIONS = """
-Devuelve SOLO títulos, sin preguntas. Estructura:
-{
- "capitulos":[
-   {"titulo":"string","subcapitulos":[{"titulo":"string"}, {"titulo":"string"}]}
- ]
-}
-Reglas:
-- 2–3 subcapítulos por capítulo.
-- Títulos claros y breves.
-- No incluyas campo "preguntas".
-"""
-
 def safe_json_loads(s: str) -> Dict[str, Any]:
     s = s.strip()
     if s.startswith("```"):
@@ -280,7 +262,6 @@ def safe_json_loads(s: str) -> Dict[str, Any]:
         raise ValueError("No se pudo parsear JSON.")
 
 def ensure_titles(struct: Dict[str, Any]) -> Dict[str, Any]:
-    """Asegura títulos no vacíos en capítulos y subcapítulos."""
     caps = struct.get("capitulos") or []
     if not caps:
         struct["capitulos"] = [{"titulo": "Capítulo 1", "subcapitulos": [{"titulo": "Bloque 1"}, {"titulo": "Bloque 2"}]}]
@@ -289,28 +270,16 @@ def ensure_titles(struct: Dict[str, Any]) -> Dict[str, Any]:
     for ci, cap in enumerate(caps, start=1):
         ct = (cap.get("titulo") or "").strip() or f"Capítulo {ci}"
         subs = cap.get("subcapitulos") or []
-        subs_fixed = []
         if not subs:
             subs = [{"titulo": "Bloque 1"}, {"titulo": "Bloque 2"}]
+        subs_fixed = []
         for si, sub in enumerate(subs, start=1):
             st = (sub.get("titulo") or "").strip() or f"Bloque {si}"
-            subs_fixed.append({"titulo": st, **({k:v for k,v in sub.items() if k!='titulo'})})
+            d = {k: v for k, v in sub.items() if k != "titulo"}
+            subs_fixed.append({"titulo": st, **d})
         fixed.append({"titulo": ct, "subcapitulos": subs_fixed})
     struct["capitulos"] = fixed
     return struct
-
-def build_structure_with_llm(llm: LLMClient, contexto_sum: str, objetivos_sum: str) -> Dict[str, Any]:
-    sys = "Eres Research Lead experto en investigación cualitativa."
-    user = f"""CONTEXTO:
-{contexto_sum}
-
-OBJETIVOS:
-{objetivos_sum}
-
-{STRUCTURE_ONLY_INSTRUCTIONS}
-"""
-    raw = llm.chat_json(sys, user, temperature=0.1)
-    return ensure_titles(safe_json_loads(raw))
 
 def ensure_2_3_subchap_per_chapter(struct: Dict[str, Any]) -> Dict[str, Any]:
     struct = ensure_titles(struct)
@@ -341,35 +310,135 @@ def build_default_structure(preguntas_count: int) -> Dict[str, Any]:
         caps.append({"titulo": f"Capítulo {i+1}", "subcapitulos": subs})
     return ensure_titles({"capitulos": caps})
 
-def distribute_questions_exact(preguntas: List[str], struct: Dict[str, Any]) -> Dict[str, Any]:
-    struct = ensure_2_3_subchap_per_chapter(struct)
-    caps = struct.get("capitulos") or []
-    sub_refs = []
-    for cap in caps:
-        cap_title = (cap.get("titulo") or "").strip() or "Capítulo"
-        subs = cap.get("subcapitulos") or []
-        fixed_subs = []
-        for s in subs:
-            st = (s.get("titulo") or "").strip() or "Bloque"
-            fixed_subs.append({"titulo": st, "preguntas": []})
-        cap["titulo"] = cap_title
-        cap["subcapitulos"] = fixed_subs
-        for s in cap["subcapitulos"]:
-            sub_refs.append(s)
 
-    if not sub_refs:
-        struct = build_default_structure(len(preguntas))
+# =====================================================
+# ESTRUCTURA SEMÁNTICA (LLM)
+# =====================================================
+# 1) Detectar capítulos/subcapítulos a partir de guía + contexto + objetivos
+STRUCTURE_SEMANTIC_PROMPT = """
+Devuelve SOLO títulos (sin preguntas) que reflejen la estructura temática de la GUÍA.
+Formato JSON:
+{
+ "capitulos":[
+   {"titulo":"string","subcapitulos":[{"titulo":"string"},{"titulo":"string"}]}
+ ]
+}
+Reglas:
+- Usa nombres cortos, claros y analíticos (máx. 60 caracteres).
+- 2–3 subcapítulos por capítulo.
+- Basado en los bloques/temas que se infieren de la GUÍA (encabezados, transiciones, etc.).
+- NO incluyas "preguntas".
+"""
+
+def build_semantic_structure(llm: LLMClient, ctx: str, obj: str, guia_text: str) -> Dict[str, Any]:
+    sys = "Eres Research Lead. Identificas bloques temáticos reales de una guía de entrevistas."
+    user = f"""CONTEXTO:
+{ctx}
+
+OBJETIVOS:
+{obj}
+
+GUÍA (texto):
+{guia_text}
+
+{STRUCTURE_SEMANTIC_PROMPT}
+"""
+    raw = llm.chat_json(sys, user, temperature=0.2)
+    return ensure_2_3_subchap_per_chapter(safe_json_loads(raw))
+
+# 2) Clasificar cada pregunta en (capítulo, subcapítulo) existentes por afinidad semántica
+CLASSIFY_PROMPT = """
+Te doy una estructura fija (capítulos/subcapítulos) y una lista de preguntas.
+Devuelve asignaciones semánticas: cada pregunta debe ir a EXACTAMENTE 1 par (capitulo, subcapitulo).
+No modifiques el texto de la pregunta.
+Formato JSON:
+{
+ "assignments":[
+   {"question":"...", "capitulo":"...", "subcapitulo":"..."}
+ ]
+}
+Usa exclusivamente los títulos dados (exact match).
+Mantén el orden de entrada en la salida.
+"""
+
+def classify_questions_to_structure(llm: LLMClient, struct: Dict[str, Any], preguntas: List[str]) -> List[Dict[str, str]]:
+    snapshot = {
+        "capitulos": [
+            {
+                "titulo": cap["titulo"],
+                "subcapitulos": [ {"titulo": s["titulo"]} for s in cap.get("subcapitulos", []) ]
+            }
+            for cap in struct.get("capitulos", [])
+        ]
+    }
+    sys = "Eres Research Lead. Clasificas preguntas en la estructura dada, por afinidad temática."
+    q_blob = "\n".join(f"- {p}" for p in preguntas)
+    user = f"""ESTRUCTURA:
+{json.dumps(snapshot, ensure_ascii=False, indent=2)}
+
+PREGUNTAS:
+{q_blob}
+
+{CLASSIFY_PROMPT}
+"""
+    raw = llm.chat_json(sys, user, temperature=0.1)
+    data = safe_json_loads(raw)
+    assigns = data.get("assignments") or []
+    # Sanitizar: asegurar que solo use títulos existentes
+    valid_caps = { cap["titulo"]: {s["titulo"] for s in cap.get("subcapitulos", [])} for cap in struct.get("capitulos", []) }
+    cleaned = []
+    for it in assigns:
+        q = (it.get("question") or "").strip()
+        c = (it.get("capitulo") or "").strip()
+        s = (it.get("subcapitulo") or "").strip()
+        if q and c in valid_caps and s in valid_caps[c]:
+            cleaned.append({"question": q, "capitulo": c, "subcapitulo": s})
+    return cleaned
+
+
+# =====================================================
+# REPARTO Y EXPORTACIÓN
+# =====================================================
+def apply_assignments(struct: Dict[str, Any], preguntas: List[str], assigns: List[Dict[str, str]]) -> Dict[str, Any]:
+    """Crea una copia de la estructura y rellena preguntas según assignments; si falta alguna, la coloca round-robin."""
+    struct = ensure_2_3_subchap_per_chapter(struct)
+    # mapa rápido cap -> sub -> lista
+    cap_map = {}
+    for cap in struct["capitulos"]:
+        ctitle = cap["titulo"]
+        cap_map[ctitle] = {}
+        for sub in cap["subcapitulos"]:
+            sub["preguntas"] = []
+            cap_map[ctitle][sub["titulo"]] = sub["preguntas"]
+
+    # Añadir según clasificación
+    assigned_set = set()
+    for it in assigns:
+        q = it["question"]
+        c = it["capitulo"]
+        s = it["subcapitulo"]
+        cap_map[c][s].append(q)
+        assigned_set.add(q.strip())
+
+    # Verificar faltantes y completar preservando orden
+    leftovers = [q for q in preguntas if q.strip() not in assigned_set]
+    if leftovers:
+        # round-robin sobre todos los subcapítulos:
         sub_refs = []
         for cap in struct["capitulos"]:
-            for s in cap["subcapitulos"]:
-                s["preguntas"] = []
-                sub_refs.append(s)
+            for sub in cap["subcapitulos"]:
+                sub_refs.append(sub["preguntas"])
+        if not sub_refs:
+            # nunca debería pasar, pero por seguridad
+            struct = build_default_structure(len(preguntas))
+            sub_refs = []
+            for cap in struct["capitulos"]:
+                for sub in cap["subcapitulos"]:
+                    sub_refs.append(sub["preguntas"])
+        for i, q in enumerate(leftovers):
+            sub_refs[i % len(sub_refs)].append(q)
 
-    total_subs = len(sub_refs) or 1
-    for idx, q in enumerate(preguntas):
-        sub_refs[idx % total_subs]["preguntas"].append(q)
-
-    return ensure_titles(struct)
+    return struct
 
 def to_dataframe(matrix: Dict[str, Any]) -> pd.DataFrame:
     rows = []
@@ -396,26 +465,43 @@ async def generate_matrix(
     openai_api_key: Optional[str] = Form(None),
     num_questions: Optional[int] = Form(None),
 ):
+    # Leer archivos
     contexto_bytes = await contexto.read()
     objetivos_bytes = await objetivos.read()
     guia_bytes = await guia.read() if guia else None
 
-    llm = LLMClient(api_key=openai_api_key)
+    # Textos base
     ctx_text = extract_text_from_pdf_bytes(contexto_bytes)
     obj_text = extract_text_from_pdf_bytes(objetivos_bytes)
 
+    # Cliente LLM
+    llm = LLMClient(api_key=openai_api_key)
+
     if guia_bytes:
-        preguntas = extract_questions_from_text_v5(extract_text_from_pdf_bytes(guia_bytes))
-        # Estructura de títulos (sin preguntas)
+        # ===== CON GUÍA: extraer TODAS las preguntas y orden SEMÁNTICO =====
+        guia_text = extract_text_from_pdf_bytes(guia_bytes)
+        preguntas = extract_questions_from_text_v5(guia_text)
+
+        # 1) Estructura semántica (capítulos y subcapítulos) basada en la guía
         try:
-            structure = build_structure_with_llm(llm, ctx_text, obj_text)
-            structure = ensure_2_3_subchap_per_chapter(structure)
+            structure = build_semantic_structure(llm, ctx_text, obj_text, guia_text)
         except Exception:
             structure = build_default_structure(len(preguntas))
-        matrix = distribute_questions_exact(preguntas, structure)
 
+        # 2) Clasificación semántica pregunta→(capítulo, subcapítulo)
+        assigns = []
+        try:
+            assigns = classify_questions_to_structure(llm, structure, preguntas)
+        except Exception:
+            assigns = []
+
+        # 3) Aplicar asignaciones y completar faltantes en orden
+        matrix = apply_assignments(structure, preguntas, assigns)
+
+        # Validación dura: filas = preguntas
         df = to_dataframe(matrix)
         if len(df) != len(preguntas):
+            # completar en último sub
             assigned = [row["Preguntas"] for _, row in df.iterrows()]
             assigned_norm = set(re.sub(r"\s+", " ", a).strip() for a in assigned)
             missing = [p for p in preguntas if re.sub(r"\s+", " ", p).strip() not in assigned_norm]
@@ -431,15 +517,18 @@ async def generate_matrix(
                 if len(df) != len(preguntas):
                     raise RuntimeError("No se pudo igualar exactamente el total de preguntas.")
     else:
-        # Sin guía: generar exactamente n preguntas + estructura
+        # ===== SIN GUÍA: generar EXACTAMENTE n preguntas y ordenarlas semánticamente =====
         n = int(num_questions or 16)
         n = max(8, min(60, n))
+
+        # Estructura temática inferida desde contexto/objetivos (sin guía)
         try:
-            structure = build_structure_with_llm(llm, ctx_text, obj_text)
-            structure = ensure_2_3_subchap_per_chapter(structure)
+            # Reutilizamos el constructor semántico con guía vacía
+            structure = build_semantic_structure(llm, ctx_text, obj_text, guia_text="")
         except Exception:
             structure = build_default_structure(n)
 
+        # Generar preguntas (exactamente n)
         sys = "Eres Research Lead. Generas preguntas claras y neutrales para una guía de entrevista."
         user = f"""CONTEXTO:
 {ctx_text}
@@ -458,9 +547,16 @@ Devuelve JSON: {{"preguntas": ["..."]}} sin texto adicional.
             preguntas = [q if q.endswith("?") else q + "?" for q in preguntas]
         except Exception:
             preguntas = [f"Pregunta {i+1}?" for i in range(n)]
-
         preguntas = preguntas[:n]
-        matrix = distribute_questions_exact(preguntas, structure)
+
+        # Clasificar semánticamente (usando estructura inferida)
+        assigns = []
+        try:
+            assigns = classify_questions_to_structure(llm, structure, preguntas)
+        except Exception:
+            assigns = []
+
+        matrix = apply_assignments(structure, preguntas, assigns)
         df = to_dataframe(matrix)
         if len(df) != n:
             assigned = [row["Preguntas"] for _, row in df.iterrows()]
@@ -473,17 +569,18 @@ Devuelve JSON: {{"preguntas": ["..."]}} sin texto adicional.
                 if len(df) != n:
                     raise RuntimeError("No se pudo igualar exactamente el total de preguntas generadas.")
 
-    # Exportar Excel
+    # ===== Exportar Excel =====
     buf = io.BytesIO()
     df.to_excel(buf, index=False, engine="openpyxl")
     buf.seek(0)
 
-    # Nombre forzado .xlsx
+    # Forzar nombre .xlsx
     safe_name = (filename_base or "matriz.xlsx").strip()
     safe_name = re.sub(r'[\\/:*?"<>|]+', "_", safe_name)
     if not safe_name.lower().endswith(".xlsx"):
         safe_name += ".xlsx"
 
+    # Registrar descarga temporal
     token = generate_token()
     exp = datetime.utcnow() + timedelta(minutes=TOKEN_EXPIRATION_MINUTES)
     DOWNLOADS[token] = (buf.getvalue(), safe_name,
@@ -494,7 +591,8 @@ Devuelve JSON: {{"preguntas": ["..."]}} sin texto adicional.
         "status": "ok",
         "download_url": f"/download/{token}",
         "filename": safe_name,
-        "detected_questions": len(df),  # filas en Excel
+        "detected_questions": len(df),  # filas en Excel = total de preguntas
+        "semantic_order": True,
         "tokens": {
             "total": llm.total_tokens,
             "prompt": llm.prompt_tokens,
