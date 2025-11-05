@@ -518,8 +518,8 @@ async def generate_matrix(
                     raise RuntimeError("No se pudo igualar exactamente el total de preguntas.")
     else:
         # ===== SIN GUÍA: generar EXACTAMENTE n preguntas y ordenarlas semánticamente =====
-        n = int(num_questions or 16)
-        n = max(8, min(150, n))
+        n = int(num_questions or 50)
+        n = max(50, min(150, n))
 
         # Estructura temática inferida desde contexto/objetivos (sin guía)
         try:
@@ -619,4 +619,5 @@ def download_token(token: str):
         "Cache-Control": "no-store",
     }
     return StreamingResponse(io.BytesIO(data), media_type=media_type, headers=headers)
+
 
