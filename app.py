@@ -14,7 +14,6 @@ from fastapi import FastAPI, File, UploadFile, Form, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse, JSONResponse
 
-from dotenv import load_dotenv
 from tenacity import retry, stop_after_attempt, wait_random_exponential
 
 # ---------- OpenAI ----------
@@ -22,9 +21,6 @@ try:
     from openai import OpenAI
 except Exception:
     OpenAI = None
-
-# ---------- Carga .env ----------
-load_dotenv()
 
 # =========================
 # App & CORS
@@ -74,22 +70,40 @@ def register_download(data: bytes, filename: str, media_type: str) -> str:
     return token
 
 # =========================
-# Config y utilidades
+# Config sin .env (constantes)
 # =========================
-MAX_UPLOAD_MB = int(os.getenv("MAX_UPLOAD_MB", "60"))
+# Tamaños/cortes para acelerar el procesamiento
+MAX_UPLOAD_MB = 60
+MAX_PAGES_CO = 30     # páginas máximas del PDF de Contexto+Objetivos
+MAX_PAGES_TR = 60     # páginas máximas del PDF de Transcripción
+MAX_PAGES_GUIDE = 20  # páginas máximas del PDF de Guía (opcional)
 
-def extract_text_from_pdf(path_or_bytes) -> str:
-    """Acepta ruta o bytes de PDF. Devuelve texto concatenado."""
+LLM_MAX_CHUNKS = 6    # tope de llamadas por función de análisis
+LLM_CHUNK_SIZE = 9000 # chars por chunk
+
+# Costeo opcional (si no se definen variables de entorno, quedan en 0)
+INPUT_COST = float(os.getenv("OPENAI_INPUT_COST_PER_1K", "0.0"))
+OUTPUT_COST = float(os.getenv("OPENAI_OUTPUT_COST_PER_1K", "0.0"))
+
+# =========================
+# Utilidades PDF / Texto
+# =========================
+def extract_text_from_pdf(path_or_bytes, max_pages: int | None = None) -> str:
+    """Acepta ruta o bytes de PDF. Lee como máximo `max_pages` páginas y concatena texto."""
     texts = []
     if isinstance(path_or_bytes, (bytes, bytearray)):
         bio = io.BytesIO(path_or_bytes)
         with pdfplumber.open(bio) as pdf:
-            for page in pdf.pages:
+            for idx, page in enumerate(pdf.pages):
+                if max_pages is not None and idx >= max_pages:
+                    break
                 txt = page.extract_text() or ""
                 texts.append(txt)
     else:
         with pdfplumber.open(path_or_bytes) as pdf:
-            for page in pdf.pages:
+            for idx, page in enumerate(pdf.pages):
+                if max_pages is not None and idx >= max_pages:
+                    break
                 txt = page.extract_text() or ""
                 texts.append(txt)
     return "\n".join(texts)
@@ -108,19 +122,28 @@ def split_into_chunks(text: str, max_chars: int = 8000) -> List[str]:
         start = end
     return chunks
 
+def split_capped(text: str, max_chars: int, max_chunks: int) -> list[str]:
+    """Divide en bloques de hasta max_chars y limita a max_chunks (compactando el resto)."""
+    raw_chunks = split_into_chunks(text, max_chars=max_chars)
+    if len(raw_chunks) <= max_chunks:
+        return raw_chunks
+    head = raw_chunks[:max_chunks - 1]
+    tail = "\n".join(raw_chunks[max_chunks - 1:])
+    return head + [tail]
+
 # =========================
 # Cliente LLM con conteo de tokens y costos
 # =========================
-INPUT_COST = float(os.getenv("OPENAI_INPUT_COST_PER_1K", "0.0"))
-OUTPUT_COST = float(os.getenv("OPENAI_OUTPUT_COST_PER_1K", "0.0"))
-
 class LLMClient:
     def __init__(self, model: Optional[str] = None):
         if OpenAI is None:
-            raise RuntimeError("Falta openai>=2.x. Instala requirements.")
+            raise RuntimeError("Falta openai>=2.x. Instala la dependencia.")
         api_key = os.getenv("OPENAI_API_KEY", "").strip()
         if not api_key:
-            raise RuntimeError("Define OPENAI_API_KEY en Render/entorno.")
+            raise RuntimeError(
+                "No hay clave de OpenAI. Define la variable de entorno OPENAI_API_KEY en tu hosting."
+            )
+        # Puedes cambiar el modelo por variable de entorno si quieres
         self.model = (model or os.getenv("OPENAI_MODEL") or "gpt-4o-mini").strip()
         self.client = OpenAI(api_key=api_key)
 
@@ -136,7 +159,8 @@ class LLMClient:
         self.prompt_tokens += int(getattr(u, "prompt_tokens", 0) or 0)
         self.completion_tokens += int(getattr(u, "completion_tokens", 0) or 0)
 
-    @retry(stop=stop_after_attempt(3), wait=wait_random_exponential(multiplier=1, max=8))
+    # Reintentos cortos para que no “explote” el tiempo total
+    @retry(stop=stop_after_attempt(2), wait=wait_random_exponential(multiplier=0.8, max=3))
     def chat(self, system: str, user: str, temperature: float = 0.2) -> str:
         resp = self.client.chat.completions.create(
             model=self.model,
@@ -147,7 +171,7 @@ class LLMClient:
         self._acc(resp)
         return resp.choices[0].message.content
 
-    @retry(stop=stop_after_attempt(3), wait=wait_random_exponential(multiplier=1, max=8))
+    @retry(stop=stop_after_attempt(2), wait=wait_random_exponential(multiplier=0.8, max=3))
     def chat_json(self, system: str, user: str, temperature: float = 0.1) -> str:
         resp = self.client.chat.completions.create(
             model=self.model,
@@ -166,11 +190,11 @@ class LLMClient:
 # Resumen jerárquico
 # =========================
 def hierarchical_summarize(llm: LLMClient, raw_text: str, label: str) -> str:
-    chunks = split_into_chunks(raw_text, max_chars=8000)
+    chunks = split_capped(raw_text, max_chars=LLM_CHUNK_SIZE, max_chunks=LLM_MAX_CHUNKS)
     summaries = []
     sys = (
         "Eres un analista senior. Resume con foco en: actores, procesos, definiciones, "
-        "restricciones y términos clave. Usa viñetas concisas."
+        "restricciones, y términos clave. Usa viñetas concisas."
     )
     for i, ch in enumerate(chunks, 1):
         user = f"Resumen parcial {label} ({i}/{len(chunks)}):\n\n{ch}"
@@ -271,7 +295,7 @@ def extract_questions_from_transcript_llm(llm: LLMClient, transcript_text: str) 
       - Inferir 'prompts' de indagación que aparecen fragmentados.
     Devuelve lista de strings (sin duplicados obvios).
     """
-    chunks = split_into_chunks(transcript_text, max_chars=8000)
+    chunks = split_capped(transcript_text, max_chars=LLM_CHUNK_SIZE, max_chunks=LLM_MAX_CHUNKS)
     sys = (
         "Eres un analista cualitativo. Extrae las PREGUNTAS (prompts del moderador) "
         "que aparecen explícitas o implícitas en la transcripción. Devuelve JSON: "
@@ -299,65 +323,65 @@ def extract_questions_from_transcript_llm(llm: LLMClient, transcript_text: str) 
     return out
 
 # =========================
-# Plantilla de Informe (capítulos/subcapítulos fijos)
+# Plantilla de Informe (más informativa)
 # =========================
 REPORT_SCHEMA = [
     {
-        "titulo": "Resumen Ejecutivo",
+        "titulo": "Panorama del Estudio",
         "subcapitulos": [
-            {"titulo": "Hallazgos clave"},
-            {"titulo": "Implicaciones para el negocio"},
-            {"titulo": "Recomendaciones priorizadas"},
+            {"titulo": "Contexto y alcance del proyecto"},
+            {"titulo": "Objetivos y preguntas guía"},
+            {"titulo": "Metodología y muestra"},
         ],
     },
     {
-        "titulo": "Contexto y Objetivos",
+        "titulo": "Audiencia y Segmentos",
         "subcapitulos": [
-            {"titulo": "Contexto del estudio"},
-            {"titulo": "Objetivos de investigación"},
+            {"titulo": "Perfil, comportamientos y necesidades"},
+            {"titulo": "Segmentaciones relevantes"},
         ],
     },
     {
-        "titulo": "Perfil de Participantes",
+        "titulo": "Jornadas y Tareas del Usuario",
         "subcapitulos": [
-            {"titulo": "Caracterización general"},
-            {"titulo": "Criterios de inclusión"},
+            {"titulo": "Etapas y momentos clave"},
+            {"titulo": "Tareas, fricciones y atajos"},
         ],
     },
     {
-        "titulo": "Experiencias y Prácticas",
+        "titulo": "Motivadores y Barreras",
         "subcapitulos": [
-            {"titulo": "Uso y hábitos actuales"},
-            {"titulo": "Momentos y tareas"},
+            {"titulo": "Drivers de adopción y uso"},
+            {"titulo": "Barreras, dolores y riesgos"},
+            {"titulo": "Trade-offs y condicionantes"},
         ],
     },
     {
-        "titulo": "Motivadores y Tensiones",
+        "titulo": "Percepción de la Solución y la Marca",
         "subcapitulos": [
-            {"titulo": "Drivers"},
-            {"titulo": "Barreras y dolores"},
-            {"titulo": "Trade-offs"},
+            {"titulo": "Valor percibido y expectativas"},
+            {"titulo": "Satisfactores, insatisfactores y comparativos"},
         ],
     },
     {
-        "titulo": "Relación con Producto/Servicio",
+        "titulo": "Oportunidades de Valor",
         "subcapitulos": [
-            {"titulo": "Percepciones y expectativas"},
-            {"titulo": "Satisfactores e insatisfactores"},
+            {"titulo": "Insights accionables"},
+            {"titulo": "Oportunidades priorizadas"},
         ],
     },
     {
-        "titulo": "Oportunidades",
+        "titulo": "Recomendaciones y Roadmap",
         "subcapitulos": [
-            {"titulo": "Mejoras rápidas (Quick wins)"},
-            {"titulo": "Propuestas de valor"},
+            {"titulo": "Quick wins (0–90 días)"},
+            {"titulo": "Iniciativas estratégicas (90–180 días)"},
         ],
     },
     {
-        "titulo": "Cierre Analítico",
+        "titulo": "Anexos Analíticos",
         "subcapitulos": [
-            {"titulo": "Hipótesis y riesgos"},
-            {"titulo": "Próximos pasos"},
+            {"titulo": "Hipótesis y supuestos"},
+            {"titulo": "Preguntas abiertas y siguientes pasos"},
         ],
     },
 ]
@@ -381,9 +405,9 @@ REGLAS:
 
 - Asigna TODAS las preguntas a algún subcapítulo.
 - Mantén el orden original de las preguntas en lo posible.
-- Si una pregunta encaja en varias categorías, elige la que mejor contribuya a la redacción del INFORME.
+- Si una pregunta encaja en varias categorías, elige la que mejor contribuya a un INFORME claro y útil.
 - Títulos de capítulos/subcapítulos deben ser EXACTAMENTE los de la plantilla.
-- Flujo analítico global del informe: contexto -> prácticas/experiencias -> motivadores/tensiones -> producto/servicio -> barreras -> oportunidades -> cierre.
+- Flujo analítico global: panorama -> audiencia -> jornadas/tareas -> motivadores/barreras -> percepción -> oportunidades -> recomendaciones -> anexos.
 """
 
 def extract_json_block(text: str) -> Optional[str]:
@@ -534,16 +558,16 @@ Preguntas:
         data = safe_json_loads(raw)
         for it in data.get("assignments", []):
             q = (it.get("question") or "").strip()
-            cap = (it.get("capitulo") or "").strip() or "Experiencias y Prácticas"
-            sub = (it.get("subcapitulo") or "").strip() or "Uso y hábitos actuales"
+            cap = (it.get("capitulo") or "").strip() or "Jornadas y Tareas del Usuario"
+            sub = (it.get("subcapitulo") or "").strip() or "Etapas y momentos clave"
             if q:
                 _append_in_order(matrix, cap, sub, q)
         return matrix
     else:
-        # Si no hay estructura, fuerza la plantilla de informe
+        # Si no hay estructura, fuerza la plantilla del informe y agrega por defecto
         matrix["capitulos"] = REPORT_SCHEMA
         for q in missing:
-            _append_in_order(matrix, "Experiencias y Prácticas", "Uso y hábitos actuales", q)
+            _append_in_order(matrix, "Jornadas y Tareas del Usuario", "Etapas y momentos clave", q)
         return matrix
 
 def enforce_subchapter_limits(matrix: Dict[str, Any], min_sub: int = 2, max_sub: int = 3) -> Dict[str, Any]:
@@ -576,7 +600,7 @@ def enforce_subchapter_limits(matrix: Dict[str, Any], min_sub: int = 2, max_sub:
         elif len(subs) > max_sub:
             keep = subs[:max_sub - 1]
             merged = {"titulo": f"{subs[max_sub - 1].get('titulo','Bloque')} · Combinado", "preguntas": []}
-            for s in subs[max_sub - 1:] and subs[max_sub - 1:]:
+            for s in subs[max_sub - 1:]:
                 merged["preguntas"].extend(s.get("preguntas", []) or [])
             cap["subcapitulos"] = keep + [merged]
     return matrix
@@ -603,10 +627,10 @@ async def generate_matrix(
     contexto_objetivos: UploadFile = File(...),     # <-- UN SOLO PDF (contexto+objetivos)
     transcripcion: UploadFile = File(...),          # <-- TRANSCRIPCIÓN OBLIGATORIA
     guia: UploadFile | None = File(None),           # <-- GUÍA OPCIONAL
-    num_questions: int | None = Form(None),         # si NO hay guía ni preguntas detectadas -> semilla
+    num_questions: int | None = Form(None),         # backup si no se detectan preguntas y no hay guía
     filename_base: str | None = Form(None),
 ):
-    # Límite de tamaño (aprox, por content-length del multipart)
+    # Límite de subida (aprox por content-length)
     try:
         content_len = int(request.headers.get("content-length", "0"))
         if content_len and content_len > MAX_UPLOAD_MB * 1024 * 1024:
@@ -628,33 +652,28 @@ async def generate_matrix(
         if guia_bytes is not None and guia and (not guia.filename.lower().endswith(".pdf")):
             raise HTTPException(status_code=400, detail="La GUÍA debe ser PDF.")
 
-        # 1) Extraer texto
-        co_raw = extract_text_from_pdf(co_bytes)
-        tr_raw = extract_text_from_pdf(tr_bytes)
-        guide_raw = extract_text_from_pdf(guia_bytes) if guia_bytes else ""
+        # 1) Extraer texto (con límites de páginas)
+        co_raw = extract_text_from_pdf(co_bytes, max_pages=MAX_PAGES_CO)
+        tr_raw = extract_text_from_pdf(tr_bytes, max_pages=MAX_PAGES_TR)
+        guide_raw = extract_text_from_pdf(guia_bytes, max_pages=MAX_PAGES_GUIDE) if guia_bytes else ""
 
         if not co_raw.strip():
             raise HTTPException(status_code=422, detail="El PDF de CONTEXTO+OBJETIVOS no contiene texto extraíble.")
         if not tr_raw.strip():
             raise HTTPException(status_code=422, detail="La TRANSCRIPCIÓN no contiene texto extraíble.")
 
-        # 2) LLM
+        # 2) LLM (resúmenes compactados)
         llm = LLMClient(model=None)
         co_sum = hierarchical_summarize(llm, co_raw, "Contexto+Objetivos")
-
-        # intento de separar objetivos del combinado para el prompt
-        # si no logramos separar, usamos co_sum para ambos (no crítico)
-        obj_sum = co_sum
+        obj_sum = co_sum  # si luego quieres separar, se puede refinar
 
         # 3) Preguntas desde GUÍA (si hay) y desde TRANSCRIPCIÓN (siempre)
         preguntas_heur = extract_questions_from_text_v2(guide_raw) if guide_raw else []
-        # también corramos heurística sobre transcripción (moderador suele preguntar)
         preguntas_heur_tr = extract_questions_from_text_v2(tr_raw)
-        # complemento LLM para captar implícitas
         preguntas_llm_tr = extract_questions_from_transcript_llm(llm, tr_raw)
 
         # Unir y deduplicar
-        all_q = []
+        all_q: List[str] = []
         for q in (preguntas_heur + preguntas_heur_tr + preguntas_llm_tr):
             if isinstance(q, str) and q.strip():
                 all_q.append(q.strip())
@@ -664,19 +683,22 @@ async def generate_matrix(
             for it in items:
                 k = re.sub(r"[\s\?¿\.,;:()\-]+", " ", it.casefold()).strip()
                 k = k.replace("á","a").replace("é","e").replace("í","i").replace("ó","o").replace("ú","u").replace("ñ","n")
-                if k in seen: 
+                if k in seen:
                     continue
                 seen.add(k); out.append(it)
             return out
 
-        preguntas: List[str] = _dedupe_keep_order(all_q)
+        preguntas = _dedupe_keep_order(all_q)
 
         # 4) Generar matriz con LLM
+        has_guide = bool(guia_bytes and guia and guia.filename)
         n_if_no_guide = None
-        if not preguntas:
-            # clamp 40..120 (por defecto 60) ya que la transcripción existe
+        if not has_guide and not preguntas:
+            # no hay guía y no se detectaron preguntas (ni en transcripción)
+            # clamp 40..120; por defecto 60
             n = 60 if (num_questions is None) else int(num_questions)
             n_if_no_guide = max(40, min(120, n))
+
         matrix = build_matrix_with_llm(llm, co_sum, obj_sum, preguntas, n_if_no_guide or 60)
 
         # 5) Cobertura total
