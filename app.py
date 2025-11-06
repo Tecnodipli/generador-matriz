@@ -8,13 +8,14 @@ import pdfplumber
 import pandas as pd
 from typing import List, Optional, Dict, Any
 from datetime import datetime, timedelta
+from threading import Lock
 
 from fastapi import FastAPI, File, UploadFile, Form, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse, JSONResponse
 
 from dotenv import load_dotenv
-from tenacity import retry, stop_after_attempt, wait_exponential_jitter
+from tenacity import retry, stop_after_attempt, wait_random_exponential
 
 # ---------- OpenAI ----------
 try:
@@ -38,6 +39,7 @@ ALLOWED_ORIGINS = [
     "https://www-dipli-ai.filesusr.com",
     "https://*.filesusr.com",
     "https://*.wixsite.com",
+    "https://generador-matriz.onrender.com",
 ]
 app.add_middleware(
     CORSMiddleware,
@@ -49,30 +51,35 @@ app.add_middleware(
 )
 
 # =========================
-# Descargas temporales
+# Descargas temporales (thread-safe)
 # =========================
 DOWNLOADS: dict[str, tuple[bytes, str, str, datetime]] = {}
 DOWNLOAD_TTL_SECS = 900  # 15 min
 ZIP_MEDIA_TYPE = "application/zip"
+_DL_LOCK = Lock()
 
 def cleanup_downloads() -> None:
     now = datetime.utcnow()
-    expired = [t for t, (_, _, _, exp) in DOWNLOADS.items() if exp <= now]
-    for t in expired:
-        DOWNLOADS.pop(t, None)
+    with _DL_LOCK:
+        expired = [t for t, (_, _, _, exp) in DOWNLOADS.items() if exp <= now]
+        for t in expired:
+            DOWNLOADS.pop(t, None)
 
 def register_download(data: bytes, filename: str, media_type: str) -> str:
     cleanup_downloads()
     token = secrets.token_urlsafe(16)
     expires_at = datetime.utcnow() + timedelta(seconds=DOWNLOAD_TTL_SECS)
-    DOWNLOADS[token] = (data, filename, media_type, expires_at)
+    with _DL_LOCK:
+        DOWNLOADS[token] = (data, filename, media_type, expires_at)
     return token
 
 # =========================
-# Utilidades generales
+# Config y utilidades
 # =========================
+MAX_UPLOAD_MB = int(os.getenv("MAX_UPLOAD_MB", "60"))
+
 def extract_text_from_pdf(path_or_bytes) -> str:
-    """Acepta ruta o bytes de PDF."""
+    """Acepta ruta o bytes de PDF. Devuelve texto concatenado."""
     texts = []
     if isinstance(path_or_bytes, (bytes, bytearray)):
         bio = io.BytesIO(path_or_bytes)
@@ -125,12 +132,11 @@ class LLMClient:
         u = getattr(resp, "usage", None)
         if not u:
             return
-        # v2.x
         self.total_tokens += int(getattr(u, "total_tokens", 0) or 0)
         self.prompt_tokens += int(getattr(u, "prompt_tokens", 0) or 0)
         self.completion_tokens += int(getattr(u, "completion_tokens", 0) or 0)
 
-    @retry(stop=stop_after_attempt(3), wait=wait_exponential_jitter(1, 8))
+    @retry(stop=stop_after_attempt(3), wait=wait_random_exponential(multiplier=1, max=8))
     def chat(self, system: str, user: str, temperature: float = 0.2) -> str:
         resp = self.client.chat.completions.create(
             model=self.model,
@@ -141,7 +147,7 @@ class LLMClient:
         self._acc(resp)
         return resp.choices[0].message.content
 
-    @retry(stop=stop_after_attempt(3), wait=wait_exponential_jitter(1, 8))
+    @retry(stop=stop_after_attempt(3), wait=wait_random_exponential(multiplier=1, max=8))
     def chat_json(self, system: str, user: str, temperature: float = 0.1) -> str:
         resp = self.client.chat.completions.create(
             model=self.model,
@@ -154,7 +160,6 @@ class LLMClient:
         return resp.choices[0].message.content
 
     def cost_usd(self) -> float:
-        # aproximación: prompt * INPUT + completion * OUTPUT
         return (self.prompt_tokens / 1000.0) * INPUT_COST + (self.completion_tokens / 1000.0) * OUTPUT_COST
 
 # =========================
@@ -176,7 +181,7 @@ def hierarchical_summarize(llm: LLMClient, raw_text: str, label: str) -> str:
     return final
 
 # =========================
-# Extracción robusta de preguntas
+# Extracción robusta de preguntas (heurística)
 # =========================
 _INTERROGATIVOS = r"(qué|como|cómo|cual|cuál|cuando|cuándo|donde|dónde|quien|quién|por qué|para qué|cuanto|cuánto|cuales|cuáles)"
 _cond_head_re = re.compile(r"^\s*(si\s+es\s+él|si\s+no\s+es\s+él)\s*:\s*$", re.IGNORECASE)
@@ -237,6 +242,7 @@ def extract_questions_from_text_v2(text: str) -> List[str]:
             i = j
             continue
         i += 1
+
     # deduplicación laxa
     def _norm(s: str) -> str:
         t = s.casefold()
@@ -256,28 +262,128 @@ def extract_questions_from_text_v2(text: str) -> List[str]:
     return out
 
 # =========================
-# Construcción de matriz
+# Extracción de preguntas desde TRANSCRIPCIÓN con LLM (complemento)
 # =========================
-MATRIX_INSTRUCTIONS = """
-Devuelve un JSON válido con esta estructura:
-{
-  "capitulos": [
+def extract_questions_from_transcript_llm(llm: LLMClient, transcript_text: str) -> List[str]:
+    """
+    Usa LLM para:
+      - Normalizar preguntas implícitas del moderador aunque no tengan signos.
+      - Inferir 'prompts' de indagación que aparecen fragmentados.
+    Devuelve lista de strings (sin duplicados obvios).
+    """
+    chunks = split_into_chunks(transcript_text, max_chars=8000)
+    sys = (
+        "Eres un analista cualitativo. Extrae las PREGUNTAS (prompts del moderador) "
+        "que aparecen explícitas o implícitas en la transcripción. Devuelve JSON: "
+        '{"preguntas": ["..."]}. No reformules innecesariamente; normaliza a preguntas claras.'
+    )
+    preguntas: List[str] = []
+    for i, ch in enumerate(chunks, 1):
+        user = f"Transcripción (bloque {i}/{len(chunks)}):\n\n{ch}\n\nDevuelve solo JSON."
+        try:
+            raw = llm.chat_json(sys, user, temperature=0.0)
+            data = json.loads(raw)
+            for q in data.get("preguntas", []) or []:
+                if isinstance(q, str) and q.strip():
+                    preguntas.append(q.strip())
+        except Exception:
+            continue
+    # dedupe simple
+    seen, out = set(), []
+    for q in preguntas:
+        k = re.sub(r"[\s\?¿]+", " ", q.casefold()).strip()
+        if k in seen:
+            continue
+        seen.add(k)
+        out.append(q)
+    return out
+
+# =========================
+# Plantilla de Informe (capítulos/subcapítulos fijos)
+# =========================
+REPORT_SCHEMA = [
     {
+        "titulo": "Resumen Ejecutivo",
+        "subcapitulos": [
+            {"titulo": "Hallazgos clave"},
+            {"titulo": "Implicaciones para el negocio"},
+            {"titulo": "Recomendaciones priorizadas"},
+        ],
+    },
+    {
+        "titulo": "Contexto y Objetivos",
+        "subcapitulos": [
+            {"titulo": "Contexto del estudio"},
+            {"titulo": "Objetivos de investigación"},
+        ],
+    },
+    {
+        "titulo": "Perfil de Participantes",
+        "subcapitulos": [
+            {"titulo": "Caracterización general"},
+            {"titulo": "Criterios de inclusión"},
+        ],
+    },
+    {
+        "titulo": "Experiencias y Prácticas",
+        "subcapitulos": [
+            {"titulo": "Uso y hábitos actuales"},
+            {"titulo": "Momentos y tareas"},
+        ],
+    },
+    {
+        "titulo": "Motivadores y Tensiones",
+        "subcapitulos": [
+            {"titulo": "Drivers"},
+            {"titulo": "Barreras y dolores"},
+            {"titulo": "Trade-offs"},
+        ],
+    },
+    {
+        "titulo": "Relación con Producto/Servicio",
+        "subcapitulos": [
+            {"titulo": "Percepciones y expectativas"},
+            {"titulo": "Satisfactores e insatisfactores"},
+        ],
+    },
+    {
+        "titulo": "Oportunidades",
+        "subcapitulos": [
+            {"titulo": "Mejoras rápidas (Quick wins)"},
+            {"titulo": "Propuestas de valor"},
+        ],
+    },
+    {
+        "titulo": "Cierre Analítico",
+        "subcapitulos": [
+            {"titulo": "Hipótesis y riesgos"},
+            {"titulo": "Próximos pasos"},
+        ],
+    },
+]
+
+MATRIX_INSTRUCTIONS = f"""
+Devuelve un JSON válido con esta estructura EXACTA:
+{{
+  "capitulos": [
+    {{
       "titulo": "string",
       "subcapitulos": [
-        {"titulo": "string", "preguntas": ["string", ...]}
+        {{"titulo": "string", "preguntas": ["string", ...]}}
       ]
-    }
+    }}
   ]
-}
-Reglas:
-- Los capítulos y subcapítulos deben alinearse con el CONTEXTO y los OBJETIVOS.
-- Si hay GUIA, debes asignar TODAS las preguntas a algún subcapítulo, sin reescribir su texto.
-- Mantén el orden original en lo posible.
-- En cada capítulo debe haber 2–3 subcapítulos.
-- Si NO hay GUIA, genera N preguntas (parámetro) totales, claras y neutrales.
-- Flujo: contexto -> prácticas/experiencias -> motivadores/tensiones -> producto/servicio -> barreras -> oportunidades -> cierre.
-- Títulos breves (<= 70 caracteres) y consistentes.
+}}
+
+REGLAS:
+- Debes usar EXCLUSIVAMENTE los siguientes capítulos y subcapítulos (no inventes ni renombres):
+{json.dumps(REPORT_SCHEMA, ensure_ascii=False, indent=2)}
+
+- Asigna TODAS las preguntas a algún subcapítulo.
+- Mantén el orden original de las preguntas en lo posible.
+- Si una pregunta encaja en varias categorías, elige la que mejor contribuya a la redacción del INFORME.
+- Títulos de capítulos/subcapítulos deben ser EXACTAMENTE los de la plantilla.
+- Flujo analítico global del informe: contexto -> prácticas/experiencias -> motivadores/tensiones -> producto/servicio -> barreras -> oportunidades -> cierre.
 """
 
 def extract_json_block(text: str) -> Optional[str]:
@@ -313,9 +419,14 @@ def safe_json_loads(s: str) -> Dict[str, Any]:
         return json.loads(blk)
     raise ValueError("No se pudo parsear JSON.")
 
-def build_matrix_with_llm(llm: LLMClient, contexto_sum: str, objetivos_sum: str,
-                          preguntas: Optional[List[str]], n_if_no_guide: int = 80) -> Dict[str, Any]:
-    sys = "Eres un Research Lead experto en cualitativo. Diseñas guías y estructuras analíticas limpias y accionables."
+def build_matrix_with_llm(
+    llm: LLMClient,
+    contexto_sum: str,
+    objetivos_sum: str,
+    preguntas: Optional[List[str]],
+    n_if_no_guide: int = 60,
+) -> Dict[str, Any]:
+    sys = "Eres un Research Lead experto en cualitativo. Diseñas estructuras analíticas de INFORME limpias y accionables."
     if preguntas:
         pregunta_blob = "\n".join(f"- {p}" for p in preguntas)
         user = f"""CONTEXTO (resumen):
@@ -324,7 +435,7 @@ def build_matrix_with_llm(llm: LLMClient, contexto_sum: str, objetivos_sum: str,
 OBJETIVOS (resumen):
 {objetivos_sum}
 
-GUIA (preguntas originales, no edites el texto):
+PREGUNTAS (de guía y/o derivadas de TRANSCRIPCIÓN; no edites el texto):
 {pregunta_blob}
 
 {MATRIX_INSTRUCTIONS}
@@ -336,7 +447,7 @@ GUIA (preguntas originales, no edites el texto):
 OBJETIVOS (resumen):
 {objetivos_sum}
 
-Genera exactamente {n_if_no_guide} preguntas totales (12–20 por capítulo aprox).
+No se detectaron preguntas. Genera exactamente {n_if_no_guide} preguntas totales alineadas al informe.
 {MATRIX_INSTRUCTIONS}
 """
     try:
@@ -364,7 +475,7 @@ def to_dataframe(matrix: Dict[str, Any]) -> pd.DataFrame:
                 rows.append({"Capitulo": cap_title, "Subcapitulo": sub_title, "Preguntas": (q or "").strip()})
     return pd.DataFrame(rows, columns=["Capitulo", "Subcapitulo", "Preguntas"])
 
-# ===== reasignación si faltan (sin "Complementarias") =====
+# ===== utilidades de estructura =====
 def _norm_light(s: str) -> str:
     if s is None:
         return ""
@@ -410,7 +521,7 @@ def assign_missing_with_llm(llm: LLMClient, matrix: Dict[str, Any],
     snap = _structure_snapshot(matrix)
     sys = "Eres Research Lead. Clasificas preguntas de guía en una estructura dada (capítulos y subcapítulos)."
     if snap:
-        user = f"""Estructura actual (úsala tal cual; no inventes nuevas):
+        user = f"""Estructura actual (úsala tal cual; NO inventes nuevas):
 {json.dumps(snap, ensure_ascii=False, indent=2)}
 
 Asigna CADA pregunta a un par (capitulo, subcapitulo) EXISTENTE. Mantén el orden.
@@ -423,27 +534,20 @@ Preguntas:
         data = safe_json_loads(raw)
         for it in data.get("assignments", []):
             q = (it.get("question") or "").strip()
-            cap = (it.get("capitulo") or "").strip() or "Capítulo 1"
-            sub = (it.get("subcapitulo") or "").strip() or "Bloque 1"
+            cap = (it.get("capitulo") or "").strip() or "Experiencias y Prácticas"
+            sub = (it.get("subcapitulo") or "").strip() or "Uso y hábitos actuales"
             if q:
                 _append_in_order(matrix, cap, sub, q)
         return matrix
     else:
-        # Si por alguna razón no hay estructura, pide crearla completa
-        user = f"""No hay estructura. Crea capítulos y 2–3 subcapítulos por capítulo, y asigna TODAS las preguntas.
-Devuelve:
-{{
-  "capitulos":[{{"titulo":"...","subcapitulos":[{{"titulo":"...","preguntas":["..."]}}]}}]
-}}
-Preguntas:
-- """ + "\n- ".join(missing)
-        raw = llm.chat_json(sys, user, temperature=0.1)
-        data = safe_json_loads(raw)
-        if data.get("capitulos"):
-            matrix["capitulos"] = data["capitulos"]
+        # Si no hay estructura, fuerza la plantilla de informe
+        matrix["capitulos"] = REPORT_SCHEMA
+        for q in missing:
+            _append_in_order(matrix, "Experiencias y Prácticas", "Uso y hábitos actuales", q)
         return matrix
 
 def enforce_subchapter_limits(matrix: Dict[str, Any], min_sub: int = 2, max_sub: int = 3) -> Dict[str, Any]:
+    # Mantiene 2–3 subcapítulos; si hay más, combina los excedentes en un "· Combinado"
     for cap in matrix.get("capitulos", []):
         subs = cap.get("subcapitulos", []) or []
         all_q = []
@@ -472,7 +576,7 @@ def enforce_subchapter_limits(matrix: Dict[str, Any], min_sub: int = 2, max_sub:
         elif len(subs) > max_sub:
             keep = subs[:max_sub - 1]
             merged = {"titulo": f"{subs[max_sub - 1].get('titulo','Bloque')} · Combinado", "preguntas": []}
-            for s in subs[max_sub - 1:]:
+            for s in subs[max_sub - 1:] and subs[max_sub - 1:]:
                 merged["preguntas"].extend(s.get("preguntas", []) or [])
             cap["subcapitulos"] = keep + [merged]
     return matrix
@@ -496,63 +600,103 @@ def health():
 @app.post("/generate_matrix")
 async def generate_matrix(
     request: Request,
-    contexto: UploadFile = File(...),
-    objetivos: UploadFile = File(...),
-    guia: UploadFile | None = File(None),
-    num_questions: int | None = Form(None),  # si no hay guía → 50..150
+    contexto_objetivos: UploadFile = File(...),     # <-- UN SOLO PDF (contexto+objetivos)
+    transcripcion: UploadFile = File(...),          # <-- TRANSCRIPCIÓN OBLIGATORIA
+    guia: UploadFile | None = File(None),           # <-- GUÍA OPCIONAL
+    num_questions: int | None = Form(None),         # si NO hay guía ni preguntas detectadas -> semilla
     filename_base: str | None = Form(None),
 ):
+    # Límite de tamaño (aprox, por content-length del multipart)
+    try:
+        content_len = int(request.headers.get("content-length", "0"))
+        if content_len and content_len > MAX_UPLOAD_MB * 1024 * 1024:
+            raise HTTPException(status_code=413, detail=f"Payload demasiado grande (> {MAX_UPLOAD_MB} MB).")
+    except ValueError:
+        pass
+
     start_dt = datetime.utcnow()
 
     try:
-        ctx_bytes = await contexto.read()
-        obj_bytes = await objetivos.read()
+        co_bytes = await contexto_objetivos.read()
+        tr_bytes = await transcripcion.read()
         guia_bytes = await guia.read() if guia is not None else None
 
-        if not contexto.filename.lower().endswith(".pdf") or not objetivos.filename.lower().endswith(".pdf"):
-            raise HTTPException(status_code=400, detail="Cargas inválidas: se requieren PDFs de CONTEXTO y OBJETIVOS.")
+        if not contexto_objetivos.filename.lower().endswith(".pdf"):
+            raise HTTPException(status_code=400, detail="Se requiere PDF combinado de CONTEXTO+OBJETIVOS.")
+        if not transcripcion.filename.lower().endswith(".pdf"):
+            raise HTTPException(status_code=400, detail="Se requiere PDF de TRANSCRIPCIÓN.")
+        if guia_bytes is not None and guia and (not guia.filename.lower().endswith(".pdf")):
+            raise HTTPException(status_code=400, detail="La GUÍA debe ser PDF.")
 
         # 1) Extraer texto
-        ctx_raw = extract_text_from_pdf(ctx_bytes)
-        obj_raw = extract_text_from_pdf(obj_bytes)
+        co_raw = extract_text_from_pdf(co_bytes)
+        tr_raw = extract_text_from_pdf(tr_bytes)
+        guide_raw = extract_text_from_pdf(guia_bytes) if guia_bytes else ""
+
+        if not co_raw.strip():
+            raise HTTPException(status_code=422, detail="El PDF de CONTEXTO+OBJETIVOS no contiene texto extraíble.")
+        if not tr_raw.strip():
+            raise HTTPException(status_code=422, detail="La TRANSCRIPCIÓN no contiene texto extraíble.")
 
         # 2) LLM
         llm = LLMClient(model=None)
-        ctx_sum = hierarchical_summarize(llm, ctx_raw, "Contexto")
-        obj_sum = hierarchical_summarize(llm, obj_raw, "Objetivos")
+        co_sum = hierarchical_summarize(llm, co_raw, "Contexto+Objetivos")
 
-        preguntas: Optional[List[str]] = None
-        if guia_bytes:
-            guide_raw = extract_text_from_pdf(guia_bytes)
-            preguntas = extract_questions_from_text_v2(guide_raw)
+        # intento de separar objetivos del combinado para el prompt
+        # si no logramos separar, usamos co_sum para ambos (no crítico)
+        obj_sum = co_sum
 
-        # 3) Generar matriz con LLM
+        # 3) Preguntas desde GUÍA (si hay) y desde TRANSCRIPCIÓN (siempre)
+        preguntas_heur = extract_questions_from_text_v2(guide_raw) if guide_raw else []
+        # también corramos heurística sobre transcripción (moderador suele preguntar)
+        preguntas_heur_tr = extract_questions_from_text_v2(tr_raw)
+        # complemento LLM para captar implícitas
+        preguntas_llm_tr = extract_questions_from_transcript_llm(llm, tr_raw)
+
+        # Unir y deduplicar
+        all_q = []
+        for q in (preguntas_heur + preguntas_heur_tr + preguntas_llm_tr):
+            if isinstance(q, str) and q.strip():
+                all_q.append(q.strip())
+
+        def _dedupe_keep_order(items: List[str]) -> List[str]:
+            seen, out = set(), []
+            for it in items:
+                k = re.sub(r"[\s\?¿\.,;:()\-]+", " ", it.casefold()).strip()
+                k = k.replace("á","a").replace("é","e").replace("í","i").replace("ó","o").replace("ú","u").replace("ñ","n")
+                if k in seen: 
+                    continue
+                seen.add(k); out.append(it)
+            return out
+
+        preguntas: List[str] = _dedupe_keep_order(all_q)
+
+        # 4) Generar matriz con LLM
         n_if_no_guide = None
         if not preguntas:
-            # clamp 50..150 (default 80)
-            n = 80 if (num_questions is None) else int(num_questions)
-            n_if_no_guide = max(50, min(150, n))
-        matrix = build_matrix_with_llm(llm, ctx_sum, obj_sum, preguntas, n_if_no_guide or 80)
+            # clamp 40..120 (por defecto 60) ya que la transcripción existe
+            n = 60 if (num_questions is None) else int(num_questions)
+            n_if_no_guide = max(40, min(120, n))
+        matrix = build_matrix_with_llm(llm, co_sum, obj_sum, preguntas, n_if_no_guide or 60)
 
-        # 4) Cobertura total sin “Complementarias”
+        # 5) Cobertura total
         if preguntas:
             ya = {_norm_light(x) for x in _collect_assigned_questions(matrix)}
             faltantes = [q for q in preguntas if _norm_light(q) not in ya]
             if faltantes:
-                matrix = assign_missing_with_llm(llm, matrix, faltantes, ctx_sum, obj_sum)
+                matrix = assign_missing_with_llm(llm, matrix, faltantes, co_sum, obj_sum)
         matrix = enforce_subchapter_limits(matrix, min_sub=2, max_sub=3)
 
-        # 5) Excel
+        # 6) Excel
         df = to_dataframe(matrix)
         if df.empty:
             raise HTTPException(status_code=500, detail="La matriz resultó vacía.")
         out_xlsx = io.BytesIO()
-        # openpyxl engine (asegúrate de tenerlo en requirements)
         df.to_excel(out_xlsx, index=False, engine="openpyxl")
         out_xlsx.seek(0)
         excel_bytes = out_xlsx.getvalue()
 
-        # 6) Métricas
+        # 7) Métricas
         end_dt = datetime.utcnow()
         duration_min = (end_dt - start_dt).total_seconds() / 60.0
         used_questions = len(_collect_assigned_questions(matrix))
@@ -561,7 +705,9 @@ async def generate_matrix(
             f"Start (UTC): {start_dt.isoformat()}Z\n"
             f"End   (UTC): {end_dt.isoformat()}Z\n"
             f"Duration min: {duration_min:.2f}\n"
-            f"Detected questions (guide): {len(preguntas) if preguntas else 0}\n"
+            f"Detected questions (guia): {len(preguntas_heur) if preguntas_heur else 0}\n"
+            f"Detected questions (transcripcion-heur): {len(preguntas_heur_tr)}\n"
+            f"Detected questions (transcripcion-LLM): {len(preguntas_llm_tr)}\n"
             f"Assigned questions (final): {used_questions}\n"
             f"Prompt tokens: {llm.prompt_tokens}\n"
             f"Completion tokens: {llm.completion_tokens}\n"
@@ -569,7 +715,7 @@ async def generate_matrix(
             f"Cost USD (est): {llm.cost_usd():.6f}\n"
         )
 
-        # 7) ZIP (xlsx + metrics.txt)
+        # 8) ZIP (xlsx + metrics.txt)
         base_name = _sanitize_filename(filename_base, "matriz")
         zip_name = f"{base_name}.zip"
         buf = io.BytesIO()
@@ -602,7 +748,8 @@ def download_token(token: str):
         raise HTTPException(status_code=404, detail="Link expirado o inválido")
     data, filename, media_type, exp = item
     if exp <= datetime.utcnow():
-        DOWNLOADS.pop(token, None)
+        with _DL_LOCK:
+            DOWNLOADS.pop(token, None)
         raise HTTPException(status_code=410, detail="Link expirado")
     headers = {
         "Content-Disposition": f'attachment; filename="{filename}"',
