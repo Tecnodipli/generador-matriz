@@ -70,18 +70,16 @@ def register_download(data: bytes, filename: str, media_type: str) -> str:
     return token
 
 # =========================
-# Config sin .env (constantes)
+# Config (sin .env)
 # =========================
-# Tamaños/cortes para acelerar el procesamiento
 MAX_UPLOAD_MB = 60
-MAX_PAGES_CO = 30     # páginas máximas del PDF de Contexto+Objetivos
-MAX_PAGES_TR = 60     # páginas máximas del PDF de Transcripción
-MAX_PAGES_GUIDE = 20  # páginas máximas del PDF de Guía (opcional)
+MAX_PAGES_CO = 30     # máx páginas de Contexto+Objetivos
+MAX_PAGES_TR = 60     # máx páginas de Transcripción (solo contexto)
+MAX_PAGES_GUIDE = 20  # máx páginas de Guía (opcional)
 
-LLM_MAX_CHUNKS = 6    # tope de llamadas por función de análisis
-LLM_CHUNK_SIZE = 9000 # chars por chunk
+LLM_MAX_CHUNKS = 6
+LLM_CHUNK_SIZE = 9000
 
-# Costeo opcional (si no se definen variables de entorno, quedan en 0)
 INPUT_COST = float(os.getenv("OPENAI_INPUT_COST_PER_1K", "0.0"))
 OUTPUT_COST = float(os.getenv("OPENAI_OUTPUT_COST_PER_1K", "0.0"))
 
@@ -89,7 +87,6 @@ OUTPUT_COST = float(os.getenv("OPENAI_OUTPUT_COST_PER_1K", "0.0"))
 # Utilidades PDF / Texto
 # =========================
 def extract_text_from_pdf(path_or_bytes, max_pages: int | None = None) -> str:
-    """Acepta ruta o bytes de PDF. Lee como máximo `max_pages` páginas y concatena texto."""
     texts = []
     if isinstance(path_or_bytes, (bytes, bytearray)):
         bio = io.BytesIO(path_or_bytes)
@@ -97,15 +94,13 @@ def extract_text_from_pdf(path_or_bytes, max_pages: int | None = None) -> str:
             for idx, page in enumerate(pdf.pages):
                 if max_pages is not None and idx >= max_pages:
                     break
-                txt = page.extract_text() or ""
-                texts.append(txt)
+                texts.append(page.extract_text() or "")
     else:
         with pdfplumber.open(path_or_bytes) as pdf:
             for idx, page in enumerate(pdf.pages):
                 if max_pages is not None and idx >= max_pages:
                     break
-                txt = page.extract_text() or ""
-                texts.append(txt)
+                texts.append(page.extract_text() or "")
     return "\n".join(texts)
 
 def split_into_chunks(text: str, max_chars: int = 8000) -> List[str]:
@@ -123,7 +118,6 @@ def split_into_chunks(text: str, max_chars: int = 8000) -> List[str]:
     return chunks
 
 def split_capped(text: str, max_chars: int, max_chunks: int) -> list[str]:
-    """Divide en bloques de hasta max_chars y limita a max_chunks (compactando el resto)."""
     raw_chunks = split_into_chunks(text, max_chars=max_chars)
     if len(raw_chunks) <= max_chunks:
         return raw_chunks
@@ -132,7 +126,7 @@ def split_capped(text: str, max_chars: int, max_chunks: int) -> list[str]:
     return head + [tail]
 
 # =========================
-# Cliente LLM con conteo de tokens y costos
+# Cliente LLM
 # =========================
 class LLMClient:
     def __init__(self, model: Optional[str] = None):
@@ -140,10 +134,7 @@ class LLMClient:
             raise RuntimeError("Falta openai>=2.x. Instala la dependencia.")
         api_key = os.getenv("OPENAI_API_KEY", "").strip()
         if not api_key:
-            raise RuntimeError(
-                "No hay clave de OpenAI. Define la variable de entorno OPENAI_API_KEY en tu hosting."
-            )
-        # Puedes cambiar el modelo por variable de entorno si quieres
+            raise RuntimeError("Define la variable de entorno OPENAI_API_KEY en tu hosting.")
         self.model = (model or os.getenv("OPENAI_MODEL") or "gpt-4o-mini").strip()
         self.client = OpenAI(api_key=api_key)
 
@@ -159,7 +150,6 @@ class LLMClient:
         self.prompt_tokens += int(getattr(u, "prompt_tokens", 0) or 0)
         self.completion_tokens += int(getattr(u, "completion_tokens", 0) or 0)
 
-    # Reintentos cortos para que no “explote” el tiempo total
     @retry(stop=stop_after_attempt(2), wait=wait_random_exponential(multiplier=0.8, max=3))
     def chat(self, system: str, user: str, temperature: float = 0.2) -> str:
         resp = self.client.chat.completions.create(
@@ -187,14 +177,14 @@ class LLMClient:
         return (self.prompt_tokens / 1000.0) * INPUT_COST + (self.completion_tokens / 1000.0) * OUTPUT_COST
 
 # =========================
-# Resumen jerárquico
+# Resumen jerárquico (para CO y Transcripción)
 # =========================
 def hierarchical_summarize(llm: LLMClient, raw_text: str, label: str) -> str:
     chunks = split_capped(raw_text, max_chars=LLM_CHUNK_SIZE, max_chunks=LLM_MAX_CHUNKS)
     summaries = []
     sys = (
         "Eres un analista senior. Resume con foco en: actores, procesos, definiciones, "
-        "restricciones, y términos clave. Usa viñetas concisas."
+        "restricciones y términos clave. Usa viñetas concisas."
     )
     for i, ch in enumerate(chunks, 1):
         user = f"Resumen parcial {label} ({i}/{len(chunks)}):\n\n{ch}"
@@ -205,11 +195,10 @@ def hierarchical_summarize(llm: LLMClient, raw_text: str, label: str) -> str:
     return final
 
 # =========================
-# Extracción robusta de preguntas (heurística)
+# Extracción de preguntas SOLO desde GUÍA (heurística)
 # =========================
 _INTERROGATIVOS = r"(qué|como|cómo|cual|cuál|cuando|cuándo|donde|dónde|quien|quién|por qué|para qué|cuanto|cuánto|cuales|cuáles)"
-_cond_head_re = re.compile(r"^\s*(si\s+es\s+él|si\s+no\s+es\s+él)\s*:\s*$", re.IGNORECASE)
-_is_instr_re = re.compile(r"^\s*(moderador:|se graba|\(se graba\))", re.IGNORECASE)
+_IS_INSTR = re.compile(r"^\s*(moderador:|se graba|\(se graba\))", re.IGNORECASE)
 
 def _clean_line(s: str) -> str:
     s = s.strip().strip("•").strip("-").strip("·").strip()
@@ -221,193 +210,71 @@ def _is_questionish(s: str) -> bool:
         return True
     return re.match(rf"^\s*{_INTERROGATIVOS}\b", s, re.IGNORECASE) is not None
 
-def _ends_like_question(s: str) -> bool:
-    return bool(re.search(r"\?\s*$", s)) or s.endswith("?")
-
-def extract_questions_from_text_v2(text: str) -> List[str]:
+def extract_questions_from_guide(text: str) -> List[str]:
+    """Extrae preguntas de la GUÍA. Mantiene orden y hace deduplicación laxa."""
     if not text:
         return []
     lines = [_clean_line(l) for l in text.splitlines()]
-    lines = [l for l in lines if l]
-    preguntas = []
-    condicion_actual: Optional[str] = None
+    lines = [l for l in lines if l and not _IS_INSTR.match(l)]
+    out = []
     i = 0
     while i < len(lines):
         ln = lines[i]
-        m = _cond_head_re.match(ln)
-        if m:
-            condicion_actual = m.group(1).strip()
-            i += 1
-            continue
-        if re.match(r"^[A-ZÁÉÍÓÚÑ].{0,80}$", ln) and not _is_questionish(ln):
-            condicion_actual = None
-        if _is_instr_re.match(ln):
-            i += 1
-            continue
         if _is_questionish(ln):
             buf = [ln]
             j = i + 1
             while j < len(lines):
                 nxt = lines[j]
-                if _is_instr_re.match(nxt) or _cond_head_re.match(nxt):
+                if _is_questionish(nxt):
                     break
-                if not _is_questionish(nxt) and not re.match(r"^[A-ZÁÉÍÓÚÑ].{0,80}$", nxt):
-                    buf.append(nxt)
-                    j += 1
-                else:
+                if re.match(r"^[A-ZÁÉÍÓÚÑ].{0,80}$", nxt):  # posible encabezado
                     break
-            merged = " ".join(buf).strip()
-            merged = re.sub(r"^\s*[•\-\u2022]\s*", "", merged)
-            if re.match(rf"^{_INTERROGATIVOS}\b", merged, re.IGNORECASE) and not _ends_like_question(merged):
-                merged += "?"
-            if condicion_actual:
-                merged = f"{merged} [Condición: {condicion_actual}]"
-            preguntas.append(merged)
+                buf.append(nxt)
+                j += 1
+            q = " ".join(buf).strip()
+            if re.match(rf"^{_INTERROGATIVOS}\b", q, re.IGNORECASE) and not q.endswith("?"):
+                q += "?"
+            out.append(q)
             i = j
+        else:
+            i += 1
+    # dedup laxa preservando orden
+    seen, final = set(), []
+    for q in out:
+        key = re.sub(r"[\s\?¿\.,;:()\-]+", " ", q.casefold()).strip()
+        key = (key
+               .replace("á","a").replace("é","e").replace("í","i")
+               .replace("ó","o").replace("ú","u").replace("ñ","n"))
+        if key in seen:
             continue
-        i += 1
-
-    # deduplicación laxa
-    def _norm(s: str) -> str:
-        t = s.casefold()
-        t = t.replace("¿", "").replace("?", "")
-        t = re.sub(r"[\s\.,;:()\-]+", " ", t).strip()
-        repl = {"á": "a", "é": "e", "í": "i", "ó": "o", "ú": "u", "ñ": "n"}
-        for a, b in repl.items():
-            t = t.replace(a, b)
-        return t
-    seen, out = set(), []
-    for q in preguntas:
-        k = _norm(q)
-        if k in seen:
-            continue
-        seen.add(k)
-        out.append(q)
-    return out
+        seen.add(key)
+        final.append(q)
+    return final
 
 # =========================
-# Extracción de preguntas desde TRANSCRIPCIÓN con LLM (complemento)
+# Instrucciones DINÁMICAS para la matriz
 # =========================
-def extract_questions_from_transcript_llm(llm: LLMClient, transcript_text: str) -> List[str]:
-    """
-    Usa LLM para:
-      - Normalizar preguntas implícitas del moderador aunque no tengan signos.
-      - Inferir 'prompts' de indagación que aparecen fragmentados.
-    Devuelve lista de strings (sin duplicados obvios).
-    """
-    chunks = split_capped(transcript_text, max_chars=LLM_CHUNK_SIZE, max_chunks=LLM_MAX_CHUNKS)
-    sys = (
-        "Eres un analista cualitativo. Extrae las PREGUNTAS (prompts del moderador) "
-        "que aparecen explícitas o implícitas en la transcripción. Devuelve JSON: "
-        '{"preguntas": ["..."]}. No reformules innecesariamente; normaliza a preguntas claras.'
-    )
-    preguntas: List[str] = []
-    for i, ch in enumerate(chunks, 1):
-        user = f"Transcripción (bloque {i}/{len(chunks)}):\n\n{ch}\n\nDevuelve solo JSON."
-        try:
-            raw = llm.chat_json(sys, user, temperature=0.0)
-            data = json.loads(raw)
-            for q in data.get("preguntas", []) or []:
-                if isinstance(q, str) and q.strip():
-                    preguntas.append(q.strip())
-        except Exception:
-            continue
-    # dedupe simple
-    seen, out = set(), []
-    for q in preguntas:
-        k = re.sub(r"[\s\?¿]+", " ", q.casefold()).strip()
-        if k in seen:
-            continue
-        seen.add(k)
-        out.append(q)
-    return out
-
-# =========================
-# Plantilla de Informe (más informativa)
-# =========================
-REPORT_SCHEMA = [
-    {
-        "titulo": "Panorama del Estudio",
-        "subcapitulos": [
-            {"titulo": "Contexto y alcance del proyecto"},
-            {"titulo": "Objetivos y preguntas guía"},
-            {"titulo": "Metodología y muestra"},
-        ],
-    },
-    {
-        "titulo": "Audiencia y Segmentos",
-        "subcapitulos": [
-            {"titulo": "Perfil, comportamientos y necesidades"},
-            {"titulo": "Segmentaciones relevantes"},
-        ],
-    },
-    {
-        "titulo": "Jornadas y Tareas del Usuario",
-        "subcapitulos": [
-            {"titulo": "Etapas y momentos clave"},
-            {"titulo": "Tareas, fricciones y atajos"},
-        ],
-    },
-    {
-        "titulo": "Motivadores y Barreras",
-        "subcapitulos": [
-            {"titulo": "Drivers de adopción y uso"},
-            {"titulo": "Barreras, dolores y riesgos"},
-            {"titulo": "Trade-offs y condicionantes"},
-        ],
-    },
-    {
-        "titulo": "Percepción de la Solución y la Marca",
-        "subcapitulos": [
-            {"titulo": "Valor percibido y expectativas"},
-            {"titulo": "Satisfactores, insatisfactores y comparativos"},
-        ],
-    },
-    {
-        "titulo": "Oportunidades de Valor",
-        "subcapitulos": [
-            {"titulo": "Insights accionables"},
-            {"titulo": "Oportunidades priorizadas"},
-        ],
-    },
-    {
-        "titulo": "Recomendaciones y Roadmap",
-        "subcapitulos": [
-            {"titulo": "Quick wins (0–90 días)"},
-            {"titulo": "Iniciativas estratégicas (90–180 días)"},
-        ],
-    },
-    {
-        "titulo": "Anexos Analíticos",
-        "subcapitulos": [
-            {"titulo": "Hipótesis y supuestos"},
-            {"titulo": "Preguntas abiertas y siguientes pasos"},
-        ],
-    },
-]
-
-MATRIX_INSTRUCTIONS = f"""
-Devuelve un JSON válido con esta estructura EXACTA:
-{{
+MATRIX_INSTRUCTIONS_DYNAMIC = """
+Devuelve un JSON válido con esta estructura:
+{
   "capitulos": [
-    {{
+    {
       "titulo": "string",
       "subcapitulos": [
-        {{"titulo": "string", "preguntas": ["string", ...]}}
+        {"titulo": "string", "preguntas": ["string", ...]}
       ]
-    }}
+    }
   ]
-}}
+}
 
 REGLAS:
-- Debes usar EXCLUSIVAMENTE los siguientes capítulos y subcapítulos (no inventes ni renombres):
-{json.dumps(REPORT_SCHEMA, ensure_ascii=False, indent=2)}
-
-- Asigna TODAS las preguntas a algún subcapítulo.
+- Genera CAPÍTULOS y SUBCAPÍTULOS DINÁMICOS, informativos y alineados al proyecto.
+- La TRANSCRIPCIÓN se usa SOLO como CONTEXTO (tono, secuencia, énfasis). NO extraigas diálogos de allí.
+- Si HAY GUÍA: usa EXACTAMENTE las preguntas de la guía (mismo número, no inventes).
+- Si NO hay GUÍA: genera EXACTAMENTE N preguntas (recibirás N) alineadas al informe.
 - Mantén el orden original de las preguntas en lo posible.
-- Si una pregunta encaja en varias categorías, elige la que mejor contribuya a un INFORME claro y útil.
-- Títulos de capítulos/subcapítulos deben ser EXACTAMENTE los de la plantilla.
-- Flujo analítico global: panorama -> audiencia -> jornadas/tareas -> motivadores/barreras -> percepción -> oportunidades -> recomendaciones -> anexos.
+- 2–5 subcapítulos por capítulo es un rango razonable; ajusta según el contenido real.
+- Títulos breves (≤ 70 caracteres), claros y orientados a informe.
 """
 
 def extract_json_block(text: str) -> Optional[str]:
@@ -445,34 +312,39 @@ def safe_json_loads(s: str) -> Dict[str, Any]:
 
 def build_matrix_with_llm(
     llm: LLMClient,
-    contexto_sum: str,
-    objetivos_sum: str,
+    co_sum: str,
+    transcript_sum: str,
     preguntas: Optional[List[str]],
-    n_if_no_guide: int = 60,
+    n_if_no_guide: Optional[int],
 ) -> Dict[str, Any]:
-    sys = "Eres un Research Lead experto en cualitativo. Diseñas estructuras analíticas de INFORME limpias y accionables."
+    """
+    - Si preguntas != None: son de la GUÍA y se usan tal cual (sin añadir ni quitar).
+    - Si preguntas == None: generar EXACTAMENTE n_if_no_guide preguntas y ESTRUCTURA dinámica.
+    """
+    sys = "Eres Research Lead experto en cualitativo. Diseñas estructuras analíticas de INFORME, claras y accionables."
     if preguntas:
         pregunta_blob = "\n".join(f"- {p}" for p in preguntas)
         user = f"""CONTEXTO (resumen):
-{contexto_sum}
+{co_sum}
 
-OBJETIVOS (resumen):
-{objetivos_sum}
+TRANSCRIPCIÓN (resumen como contexto; no extraer diálogos):
+{transcript_sum}
 
-PREGUNTAS (de guía y/o derivadas de TRANSCRIPCIÓN; no edites el texto):
+PREGUNTAS DE LA GUÍA (usa exactamente estas; no agregues ni quites):
 {pregunta_blob}
 
-{MATRIX_INSTRUCTIONS}
+{MATRIX_INSTRUCTIONS_DYNAMIC}
 """
     else:
+        n = n_if_no_guide or 60
         user = f"""CONTEXTO (resumen):
-{contexto_sum}
+{co_sum}
 
-OBJETIVOS (resumen):
-{objetivos_sum}
+TRANSCRIPCIÓN (resumen como contexto; no extraer diálogos):
+{transcript_sum}
 
-No se detectaron preguntas. Genera exactamente {n_if_no_guide} preguntas totales alineadas al informe.
-{MATRIX_INSTRUCTIONS}
+NO hay guía. Genera EXACTAMENTE {n} preguntas y, además, organiza todo en capítulos/subcapítulos dinámicos con tono de informe.
+{MATRIX_INSTRUCTIONS_DYNAMIC}
 """
     try:
         raw = llm.chat_json(sys, user, temperature=0.15)
@@ -493,13 +365,13 @@ def to_dataframe(matrix: Dict[str, Any]) -> pd.DataFrame:
     rows = []
     for cap in matrix.get("capitulos", []):
         cap_title = (cap.get("titulo") or "").strip()
-        for sub in cap.get("subcapitulos", []):
+        for sub in cap.get("subcapitulos", []) or []:
             sub_title = (sub.get("titulo") or "").strip()
             for q in sub.get("preguntas", []) or []:
                 rows.append({"Capitulo": cap_title, "Subcapitulo": sub_title, "Preguntas": (q or "").strip()})
     return pd.DataFrame(rows, columns=["Capitulo", "Subcapitulo", "Preguntas"])
 
-# ===== utilidades de estructura =====
+# ===== utilidades estructura =====
 def _norm_light(s: str) -> str:
     if s is None:
         return ""
@@ -541,14 +413,19 @@ def _append_in_order(matrix: Dict[str, Any], cap_title: str, sub_title: str, que
     matrix["capitulos"] = caps
 
 def assign_missing_with_llm(llm: LLMClient, matrix: Dict[str, Any],
-                            missing: List[str], contexto_sum: str, objetivos_sum: str) -> Dict[str, Any]:
+                            missing: List[str], co_sum: str, transcript_sum: str) -> Dict[str, Any]:
+    """Si alguna pregunta de la guía quedó sin asignar, clasifícala en la estructura existente."""
     snap = _structure_snapshot(matrix)
-    sys = "Eres Research Lead. Clasificas preguntas de guía en una estructura dada (capítulos y subcapítulos)."
+    sys = "Eres Research Lead. Clasificas preguntas en una estructura dada (capítulos y subcapítulos)."
     if snap:
         user = f"""Estructura actual (úsala tal cual; NO inventes nuevas):
 {json.dumps(snap, ensure_ascii=False, indent=2)}
 
-Asigna CADA pregunta a un par (capitulo, subcapitulo) EXISTENTE. Mantén el orden.
+Referencia (contexto):
+- CONTEXTO: {co_sum[:900]}
+- TRANSCRIPCIÓN: {transcript_sum[:900]}
+
+Asigna CADA pregunta a un (capitulo, subcapitulo) EXISTENTE. Mantén el orden.
 Devuelve JSON con:
 {{"assignments":[{{"question":"...","capitulo":"...","subcapitulo":"..."}}, ...]}}
 
@@ -558,52 +435,17 @@ Preguntas:
         data = safe_json_loads(raw)
         for it in data.get("assignments", []):
             q = (it.get("question") or "").strip()
-            cap = (it.get("capitulo") or "").strip() or "Jornadas y Tareas del Usuario"
-            sub = (it.get("subcapitulo") or "").strip() or "Etapas y momentos clave"
+            cap = (it.get("capitulo") or "").strip() or "Capítulo 1"
+            sub = (it.get("subcapitulo") or "").strip() or "Bloque 1"
             if q:
                 _append_in_order(matrix, cap, sub, q)
         return matrix
     else:
-        # Si no hay estructura, fuerza la plantilla del informe y agrega por defecto
-        matrix["capitulos"] = REPORT_SCHEMA
+        # Si por alguna razón no hay estructura, crea una mínima y coloca allí
+        matrix["capitulos"] = [{"titulo": "Capítulo 1", "subcapitulos": [{"titulo": "Bloque 1", "preguntas": []}]}]
         for q in missing:
-            _append_in_order(matrix, "Jornadas y Tareas del Usuario", "Etapas y momentos clave", q)
+            _append_in_order(matrix, "Capítulo 1", "Bloque 1", q)
         return matrix
-
-def enforce_subchapter_limits(matrix: Dict[str, Any], min_sub: int = 2, max_sub: int = 3) -> Dict[str, Any]:
-    # Mantiene 2–3 subcapítulos; si hay más, combina los excedentes en un "· Combinado"
-    for cap in matrix.get("capitulos", []):
-        subs = cap.get("subcapitulos", []) or []
-        all_q = []
-        for s in subs:
-            all_q.extend(s.get("preguntas", []) or [])
-        if len(subs) == 0:
-            n_parts = min_sub
-            chunk = max(1, len(all_q) // n_parts) if all_q else 0
-            new_subs, pos = [], 0
-            for i in range(n_parts):
-                chunk_q = all_q[pos:pos + chunk] if all_q else []
-                pos += chunk
-                new_subs.append({"titulo": f"Bloque {i + 1}", "preguntas": chunk_q})
-            cap["subcapitulos"] = new_subs
-        elif len(subs) == 1:
-            target = 3 if len(all_q) > 15 else 2
-            target = max(min_sub, min(max_sub, target))
-            chunk = max(1, (len(all_q) + target - 1) // target)
-            new_subs, pos = [], 0
-            base_title = subs[0].get('titulo', 'Bloque').split("·")[0].strip()
-            for i in range(target):
-                chunk_q = all_q[pos:pos + chunk]
-                pos += chunk
-                new_subs.append({"titulo": f"{base_title} · Parte {i + 1}", "preguntas": chunk_q})
-            cap["subcapitulos"] = new_subs
-        elif len(subs) > max_sub:
-            keep = subs[:max_sub - 1]
-            merged = {"titulo": f"{subs[max_sub - 1].get('titulo','Bloque')} · Combinado", "preguntas": []}
-            for s in subs[max_sub - 1:]:
-                merged["preguntas"].extend(s.get("preguntas", []) or [])
-            cap["subcapitulos"] = keep + [merged]
-    return matrix
 
 def _sanitize_filename(name: Optional[str], default: str) -> str:
     base = (name or default).strip()
@@ -624,13 +466,13 @@ def health():
 @app.post("/generate_matrix")
 async def generate_matrix(
     request: Request,
-    contexto_objetivos: UploadFile = File(...),     # <-- UN SOLO PDF (contexto+objetivos)
-    transcripcion: UploadFile = File(...),          # <-- TRANSCRIPCIÓN OBLIGATORIA
-    guia: UploadFile | None = File(None),           # <-- GUÍA OPCIONAL
-    num_questions: int | None = Form(None),         # backup si no se detectan preguntas y no hay guía
+    contexto_objetivos: UploadFile = File(...),     # UN SOLO PDF (contexto+objetivos)
+    transcripcion: UploadFile = File(...),          # TRANSCRIPCIÓN (contexto; NO extrae preguntas)
+    guia: UploadFile | None = File(None),           # GUÍA (opcional)
+    num_questions: int | None = Form(None),         # requerido SOLO si no hay guía (40..120; default 60)
     filename_base: str | None = Form(None),
 ):
-    # Límite de subida (aprox por content-length)
+    # Límite de carga
     try:
         content_len = int(request.headers.get("content-length", "0"))
         if content_len and content_len > MAX_UPLOAD_MB * 1024 * 1024:
@@ -662,52 +504,41 @@ async def generate_matrix(
         if not tr_raw.strip():
             raise HTTPException(status_code=422, detail="La TRANSCRIPCIÓN no contiene texto extraíble.")
 
-        # 2) LLM (resúmenes compactados)
+        # 2) LLM: resúmenes (transcripción solo como contexto)
         llm = LLMClient(model=None)
         co_sum = hierarchical_summarize(llm, co_raw, "Contexto+Objetivos")
-        obj_sum = co_sum  # si luego quieres separar, se puede refinar
+        tr_sum = hierarchical_summarize(llm, tr_raw, "Transcripción (contexto)")
 
-        # 3) Preguntas desde GUÍA (si hay) y desde TRANSCRIPCIÓN (siempre)
-        preguntas_heur = extract_questions_from_text_v2(guide_raw) if guide_raw else []
-        preguntas_heur_tr = extract_questions_from_text_v2(tr_raw)
-        preguntas_llm_tr = extract_questions_from_transcript_llm(llm, tr_raw)
+        # 3) Preguntas: SOLO de la GUÍA si existe; si no, se generarán N
+        preguntas: Optional[List[str]] = None
+        preguntas_guide_count = 0
+        if guide_raw:
+            preguntas = extract_questions_from_guide(guide_raw)
+            preguntas_guide_count = len(preguntas)
 
-        # Unir y deduplicar
-        all_q: List[str] = []
-        for q in (preguntas_heur + preguntas_heur_tr + preguntas_llm_tr):
-            if isinstance(q, str) and q.strip():
-                all_q.append(q.strip())
-
-        def _dedupe_keep_order(items: List[str]) -> List[str]:
-            seen, out = set(), []
-            for it in items:
-                k = re.sub(r"[\s\?¿\.,;:()\-]+", " ", it.casefold()).strip()
-                k = k.replace("á","a").replace("é","e").replace("í","i").replace("ó","o").replace("ú","u").replace("ñ","n")
-                if k in seen:
-                    continue
-                seen.add(k); out.append(it)
-            return out
-
-        preguntas = _dedupe_keep_order(all_q)
-
-        # 4) Generar matriz con LLM
-        has_guide = bool(guia_bytes and guia and guia.filename)
-        n_if_no_guide = None
-        if not has_guide and not preguntas:
-            # no hay guía y no se detectaron preguntas (ni en transcripción)
-            # clamp 40..120; por defecto 60
+        # 4) Generar matriz con LLM (estructura dinámica SIEMPRE)
+        has_guide = bool(preguntas and preguntas_guide_count > 0)
+        n_if_no_guide: Optional[int] = None
+        if not has_guide:
             n = 60 if (num_questions is None) else int(num_questions)
             n_if_no_guide = max(40, min(120, n))
 
-        matrix = build_matrix_with_llm(llm, co_sum, obj_sum, preguntas, n_if_no_guide or 60)
+        matrix = build_matrix_with_llm(llm, co_sum, tr_sum, preguntas, n_if_no_guide)
 
-        # 5) Cobertura total
-        if preguntas:
-            ya = {_norm_light(x) for x in _collect_assigned_questions(matrix)}
-            faltantes = [q for q in preguntas if _norm_light(q) not in ya]
-            if faltantes:
-                matrix = assign_missing_with_llm(llm, matrix, faltantes, co_sum, obj_sum)
-        matrix = enforce_subchapter_limits(matrix, min_sub=2, max_sub=3)
+        # 5) Si hay guía, validar que el conteo coincida (no añadir ni quitar)
+        if has_guide:
+            assigned = _collect_assigned_questions(matrix)
+            if len(assigned) != preguntas_guide_count:
+                ya = {_norm_light(x) for x in assigned}
+                faltantes = [q for q in preguntas if _norm_light(q) not in ya]
+                if faltantes:
+                    matrix = assign_missing_with_llm(llm, matrix, faltantes, co_sum, tr_sum)
+                assigned2 = _collect_assigned_questions(matrix)
+                if len(assigned2) != preguntas_guide_count:
+                    raise HTTPException(
+                        status_code=500,
+                        detail="La matriz no coincide con el número de preguntas de la guía. Intenta de nuevo."
+                    )
 
         # 6) Excel
         df = to_dataframe(matrix)
@@ -727,9 +558,7 @@ async def generate_matrix(
             f"Start (UTC): {start_dt.isoformat()}Z\n"
             f"End   (UTC): {end_dt.isoformat()}Z\n"
             f"Duration min: {duration_min:.2f}\n"
-            f"Detected questions (guia): {len(preguntas_heur) if preguntas_heur else 0}\n"
-            f"Detected questions (transcripcion-heur): {len(preguntas_heur_tr)}\n"
-            f"Detected questions (transcripcion-LLM): {len(preguntas_llm_tr)}\n"
+            f"Guide questions (if any): {preguntas_guide_count}\n"
             f"Assigned questions (final): {used_questions}\n"
             f"Prompt tokens: {llm.prompt_tokens}\n"
             f"Completion tokens: {llm.completion_tokens}\n"
