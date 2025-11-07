@@ -75,7 +75,7 @@ def register_download(data: bytes, filename: str, media_type: str) -> str:
 MAX_UPLOAD_MB = 60
 MAX_PAGES_CO = 30     # máx páginas de Contexto+Objetivos
 MAX_PAGES_TR = 60     # máx páginas de Transcripción (solo contexto)
-MAX_PAGES_GUIDE = 20  # máx páginas de Guía (opcional)
+MAX_PAGES_GUIDE = 80  # máx páginas de Guía (subido para no truncar). Pon None si quieres sin límite.
 
 LLM_MAX_CHUNKS = 6
 LLM_CHUNK_SIZE = 9000
@@ -91,15 +91,13 @@ def extract_text_from_pdf(path_or_bytes, max_pages: int | None = None) -> str:
     if isinstance(path_or_bytes, (bytes, bytearray)):
         bio = io.BytesIO(path_or_bytes)
         with pdfplumber.open(bio) as pdf:
-            for idx, page in enumerate(pdf.pages):
-                if max_pages is not None and idx >= max_pages:
-                    break
+            pages = pdf.pages if max_pages is None else pdf.pages[:max_pages]
+            for page in pages:
                 texts.append(page.extract_text() or "")
     else:
         with pdfplumber.open(path_or_bytes) as pdf:
-            for idx, page in enumerate(pdf.pages):
-                if max_pages is not None and idx >= max_pages:
-                    break
+            pages = pdf.pages if max_pages is None else pdf.pages[:max_pages]
+            for page in pages:
                 texts.append(page.extract_text() or "")
     return "\n".join(texts)
 
@@ -195,75 +193,70 @@ def hierarchical_summarize(llm: LLMClient, raw_text: str, label: str) -> str:
     return final
 
 # =========================
-# Extracción de preguntas SOLO desde GUÍA (une líneas hasta '?')
+# EXTRACCIÓN DE PREGUNTAS (robusta) — desde la GUÍA
 # =========================
 _INTERROGATIVOS = r"(qué|como|cómo|cual|cuál|cuando|cuándo|donde|dónde|quien|quién|por qué|para qué|cuanto|cuánto|cuales|cuáles)"
-_IS_INSTR = re.compile(r"^\s*(ent\.|moderador:|se graba|\(se graba\)|lea:|rompe hielo)", re.IGNORECASE)
+_IS_INSTR = re.compile(r"\b(ent\.|moderador:|se graba|\(se graba\)|lea:|rompe hielo)\b", re.IGNORECASE)
 
-def _clean_line(s: str) -> str:
+def _preclean_pdf_text(s: str) -> str:
+    if not s:
+        return ""
+    # Une cortes por guion al final de línea: "dise-\nño" -> "diseño"
+    s = re.sub(r"-\s*\n\s*", "", s)
+    # Normaliza saltos múltiples a uno
     s = s.replace("\r", "\n")
-    s = re.sub(r"[•·\u2022\-]+\s*", "", s.strip())
-    s = re.sub(r"\s+", " ", s)
-    return s.strip()
+    s = re.sub(r"\n{2,}", "\n", s)
+    # Elimina bullets/símbolos sueltos
+    s = re.sub(r"[•·\u2022]", "", s)
+    return s
 
-def _looks_like_question_start(s: str) -> bool:
-    return s.strip().startswith("¿") or re.match(rf"^\s*{_INTERROGATIVOS}\b", s, re.IGNORECASE) is not None
-
-def _must_continue(s: str) -> bool:
-    s2 = s.strip()
-    if s2.endswith("?"):
-        return False
-    if _IS_INSTR.match(s2):
-        return True
-    if re.match(r"^(y|o|para|en|de|del|la|el|los|las|que|cuál|cuáles|\(|,)", s2, re.IGNORECASE):
-        return True
-    if (not _looks_like_question_start(s2)) and (not s2.endswith("?")):
-        return True
-    return False
+def _clean_inside_question(q: str) -> str:
+    # Quita aclaraciones tipo (ENT. ...), [ENT. ...]
+    q = re.sub(r"\(\s*ENT\.[^)]+\)", "", q, flags=re.IGNORECASE)
+    q = re.sub(r"\[\s*ENT\.[^\]]+\]", "", q, flags=re.IGNORECASE)
+    # Quita prefijos de instrucción si quedaron pegados
+    q = re.sub(r"^\s*ENT\.\s*", "", q, flags=re.IGNORECASE)
+    # Normaliza espacios
+    q = q.replace("\r", " ").replace("\n", " ")
+    q = re.sub(r"\s+", " ", q).strip()
+    # Asegura que termine en ?
+    if not q.endswith("?"):
+        q = q.rstrip(".… ") + "?"
+    q = re.sub(r"\s+\?", "?", q)
+    return q
 
 def extract_questions_from_guide(text: str) -> List[str]:
+    """
+    Extrae TODAS las preguntas detectando bloques '¿ ... ?' a través de saltos de línea.
+    No deduplica; respeta orden.
+    """
     if not text:
         return []
-    raw_lines = [l for l in text.replace("\r", "\n").split("\n") if l.strip()]
-    lines = []
-    for l in raw_lines:
-        cl = _clean_line(l)
-        if not cl:
-            continue
-        lines.append(cl)
+    s = _preclean_pdf_text(text)
 
+    # Patrón: captura minimalista desde '¿' hasta '?' (DOTALL para saltos de línea)
+    pattern = re.compile(r"¿[^?]*?\?", flags=re.DOTALL)
+    matches = pattern.findall(s)
     out: List[str] = []
-    buf = ""
-    for ln in lines:
-        if not buf:
-            if _looks_like_question_start(ln):
-                buf = ln
-                if ln.endswith("?"):
-                    out.append(buf.strip()); buf = ""
-            else:
-                continue
-        else:
-            if _must_continue(ln):
-                buf = (buf + " " + ln).strip()
-                if ln.endswith("?"):
-                    out.append(buf.strip()); buf = ""
-            else:
-                if not buf.endswith("?"):
-                    buf = buf.rstrip(".… ") + "?"
-                out.append(buf.strip())
-                if _looks_like_question_start(ln):
-                    buf = ln.strip()
-                    if ln.endswith("?"):
-                        out.append(buf.strip()); buf = ""
-                else:
-                    buf = ""
-    if buf:
-        if not buf.endswith("?"):
-            buf = buf.rstrip(".… ") + "?"
-        out.append(buf.strip())
 
-    out = [re.sub(r"\s+", " ", q).strip() for q in out if q.strip()]
-    return out  # sin deduplicar, respeta orden
+    # Rescate secundario si el PDF no usa '¿' de apertura
+    if len(matches) < 5:
+        flat = re.sub(r"\s+", " ", s)
+        parts = [p.strip() for p in flat.split("?") if p.strip()]
+        for p in parts:
+            cand = (p + "?").strip()
+            if re.search(rf"\b{_INTERROGATIVOS}\b", cand, flags=re.IGNORECASE):
+                matches.append(cand)
+
+    for m in matches:
+        q = _clean_inside_question(m)
+        if _IS_INSTR.search(q) and not q.strip().startswith("¿"):
+            continue
+        out.append(q)
+
+    # Filtro final: descarta falsos positivos muy cortos
+    out = [q for q in out if len(q) >= 6]
+    return out  # sin deduplicar
 
 # =========================
 # Prompts y helpers de estructura/asignación
@@ -313,7 +306,7 @@ Estructura JSON final:
   ]
 }
 REGLAS:
-- Genera títulos informativos (<=70 caracteres) con tono de informe.
+- Títulos informativos (<=70 caracteres) con tono de informe.
 - La TRANSCRIPCIÓN es SOLO contexto (tono/secuencia), no extraigas diálogos.
 - Genera EXACTAMENTE N preguntas en total, claras y neutrales, y distribúyelas en los subcapítulos.
 """
