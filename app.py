@@ -6,7 +6,7 @@ import zipfile
 import secrets
 import pdfplumber
 import pandas as pd
-from typing import List, Optional, Dict, Any, Tuple
+from typing import List, Optional, Dict, Any
 from datetime import datetime, timedelta
 from threading import Lock
 
@@ -195,51 +195,78 @@ def hierarchical_summarize(llm: LLMClient, raw_text: str, label: str) -> str:
     return final
 
 # =========================
-# Extracción de preguntas SOLO desde GUÍA (sin deduplicar)
+# Extracción de preguntas SOLO desde GUÍA (une líneas hasta '?')
 # =========================
 _INTERROGATIVOS = r"(qué|como|cómo|cual|cuál|cuando|cuándo|donde|dónde|quien|quién|por qué|para qué|cuanto|cuánto|cuales|cuáles)"
-_IS_INSTR = re.compile(r"^\s*(moderador:|se graba|\(se graba\))", re.IGNORECASE)
+_IS_INSTR = re.compile(r"^\s*(ent\.|moderador:|se graba|\(se graba\)|lea:|rompe hielo)", re.IGNORECASE)
 
 def _clean_line(s: str) -> str:
-    s = s.strip().strip("•").strip("-").strip("·").strip()
+    s = s.replace("\r", "\n")
+    s = re.sub(r"[•·\u2022\-]+\s*", "", s.strip())
     s = re.sub(r"\s+", " ", s)
-    return s
+    return s.strip()
 
-def _is_questionish(s: str) -> bool:
-    if "?" in s or "¿" in s:
+def _looks_like_question_start(s: str) -> bool:
+    return s.strip().startswith("¿") or re.match(rf"^\s*{_INTERROGATIVOS}\b", s, re.IGNORECASE) is not None
+
+def _must_continue(s: str) -> bool:
+    s2 = s.strip()
+    if s2.endswith("?"):
+        return False
+    if _IS_INSTR.match(s2):
         return True
-    return re.match(rf"^\s*{_INTERROGATIVOS}\b", s, re.IGNORECASE) is not None
+    if re.match(r"^(y|o|para|en|de|del|la|el|los|las|que|cuál|cuáles|\(|,)", s2, re.IGNORECASE):
+        return True
+    if (not _looks_like_question_start(s2)) and (not s2.endswith("?")):
+        return True
+    return False
 
 def extract_questions_from_guide(text: str) -> List[str]:
-    """Extrae preguntas de la GUÍA manteniendo ORDEN y SIN deduplicar."""
     if not text:
         return []
-    lines = [_clean_line(l) for l in text.splitlines()]
-    lines = [l for l in lines if l and not _IS_INSTR.match(l)]
-    out = []
-    i = 0
-    while i < len(lines):
-        ln = lines[i]
-        if _is_questionish(ln):
-            buf = [ln]
-            j = i + 1
-            while j < len(lines):
-                nxt = lines[j]
-                if _is_questionish(nxt): break
-                if re.match(r"^[A-ZÁÉÍÓÚÑ].{0,80}$", nxt): break
-                buf.append(nxt)
-                j += 1
-            q = " ".join(buf).strip()
-            if re.match(rf"^{_INTERROGATIVOS}\b", q, re.IGNORECASE) and not q.endswith("?"):
-                q += "?"
-            out.append(q)
-            i = j
+    raw_lines = [l for l in text.replace("\r", "\n").split("\n") if l.strip()]
+    lines = []
+    for l in raw_lines:
+        cl = _clean_line(l)
+        if not cl:
+            continue
+        lines.append(cl)
+
+    out: List[str] = []
+    buf = ""
+    for ln in lines:
+        if not buf:
+            if _looks_like_question_start(ln):
+                buf = ln
+                if ln.endswith("?"):
+                    out.append(buf.strip()); buf = ""
+            else:
+                continue
         else:
-            i += 1
-    return out
+            if _must_continue(ln):
+                buf = (buf + " " + ln).strip()
+                if ln.endswith("?"):
+                    out.append(buf.strip()); buf = ""
+            else:
+                if not buf.endswith("?"):
+                    buf = buf.rstrip(".… ") + "?"
+                out.append(buf.strip())
+                if _looks_like_question_start(ln):
+                    buf = ln.strip()
+                    if ln.endswith("?"):
+                        out.append(buf.strip()); buf = ""
+                else:
+                    buf = ""
+    if buf:
+        if not buf.endswith("?"):
+            buf = buf.rstrip(".… ") + "?"
+        out.append(buf.strip())
+
+    out = [re.sub(r"\s+", " ", q).strip() for q in out if q.strip()]
+    return out  # sin deduplicar, respeta orden
 
 # =========================
-# Prompts (estructura y asignación exacta, 3 subcapítulos)
+# Prompts y helpers de estructura/asignación
 # =========================
 STRUCTURE_ONLY_PROMPT = """
 Devuelve SOLO un objeto JSON con:
@@ -324,7 +351,6 @@ def safe_json_loads(s: str) -> Dict[str, Any]:
         return json.loads(blk)
     raise ValueError("No se pudo parsear JSON.")
 
-# ---------- Paso A: estructura (exactamente 3 subcapítulos) ----------
 def build_structure_only(llm: LLMClient, co_sum: str, transcript_sum: str) -> Dict[str, Any]:
     sys = "Eres Research Lead. Defines capítulos y subcapítulos informativos."
     user = f"""CONTEXTO (resumen):
@@ -338,18 +364,16 @@ TRANSCRIPCIÓN (resumen como contexto; no extraer diálogos):
     raw = llm.chat_json(sys, user, temperature=0.15)
     data = safe_json_loads(raw)
 
-    # Normalización: asegurar EXACTAMENTE 3 subcapítulos por capítulo
+    # Normalización → EXACTAMENTE 3 subcapítulos por capítulo
     caps_out = []
     for i, cap in enumerate(data.get("capitulos", []) or [], 1):
         cap_title = (cap.get("titulo") or f"Capítulo {i}").strip()
         subs = cap.get("subcapitulos", []) or []
-        # Coerce to list of dicts with titulo
         norm = []
         for j, s in enumerate(subs, 1):
             t = s.get("titulo") if isinstance(s, dict) else str(s)
             t = (t or f"Subcapítulo {j}").strip()
             norm.append({"titulo": t})
-        # pad / trim to 3
         while len(norm) < 3:
             norm.append({"titulo": f"Subcapítulo {len(norm)+1}"})
         if len(norm) > 3:
@@ -359,7 +383,6 @@ TRANSCRIPCIÓN (resumen como contexto; no extraer diálogos):
         caps_out = [{"titulo": "Capítulo 1", "subcapitulos": [{"titulo": "Subcapítulo 1"},{"titulo": "Subcapítulo 2"},{"titulo": "Subcapítulo 3"}]}]
     return {"capitulos": caps_out}
 
-# ---------- Paso B: Asignación EXACTA (no cortar preguntas) ----------
 def classify_by_assignments(
     llm: LLMClient,
     structure: Dict[str, Any],
@@ -385,19 +408,15 @@ Referencia (contexto):
     raw = llm.chat_json(sys, user, temperature=0.1)
     data = safe_json_loads(raw)
 
-    # Construir matriz desde assignments para NO partir preguntas
-    # Mapa: (cap, sub) -> list[preguntas]
+    # Construir matriz desde assignments sin cortar preguntas
     matrix: Dict[str, Dict[str, List[str]]] = {}
-    # Pre-cargar estructura con subcapítulos y bucket "Preguntas sin asignar"
     for cap in structure["capitulos"]:
         ctitle = cap["titulo"]
         matrix.setdefault(ctitle, {})
         for sub in cap["subcapitulos"]:
             matrix[ctitle].setdefault(sub["titulo"], [])
-        # bucket por si acaso
         matrix[ctitle].setdefault("Preguntas sin asignar", [])
 
-    # Insertar assignments (respetando texto exacto)
     for a in data.get("assignments", []):
         q = (a.get("question") or "").strip()
         c = (a.get("capitulo") or "").strip()
@@ -405,34 +424,81 @@ Referencia (contexto):
         if not q:
             continue
         if not c or c not in matrix:
-            # cae al primer capítulo
             c = list(matrix.keys())[0]
         if not s or s not in matrix[c]:
             s = "Preguntas sin asignar"
         matrix[c][s].append(q)
 
-    # Asegurar que TODAS las preguntas están (si faltó alguna, enviar a bucket)
     assigned_flat = {q for caps in matrix.values() for lst in caps.values() for q in lst}
     for q in questions:
         if q not in assigned_flat:
             first_cap = list(matrix.keys())[0]
             matrix[first_cap]["Preguntas sin asignar"].append(q)
 
-    # Construir objeto matriz final
     out_caps = []
     for ctitle, submap in matrix.items():
         subs = []
-        # Mantener EXACTAMENTE 3 subcapítulos visibles + bucket si quedó algo
-        # Tomar primero los 3 que estaban en la estructura
         base_subs = [s["titulo"] for s in next(c for c in structure["capitulos"] if c["titulo"]==ctitle)["subcapitulos"]]
         for stitle in base_subs:
             subs.append({"titulo": stitle, "preguntas": submap.get(stitle, [])})
-        # si hay en "Preguntas sin asignar", lo agregamos como 4to extra (no cuenta para la regla de 3)
         extra = submap.get("Preguntas sin asignar", [])
         if extra:
             subs.append({"titulo": "Preguntas sin asignar", "preguntas": extra})
         out_caps.append({"titulo": ctitle, "subcapitulos": subs})
     return {"capitulos": out_caps}
+
+# ------- Fallback temático (si LLM deja demasiadas sin asignar) -------
+def _norm_text(s: str) -> str:
+    s = s.lower()
+    s = s.replace("á","a").replace("é","e").replace("í","i").replace("ó","o").replace("ú","u").replace("ñ","n")
+    s = re.sub(r"[^a-z0-9\s]", " ", s)
+    s = re.sub(r"\s+", " ", s).strip()
+    return s
+
+_KEYWORDS = {
+    "perfil": [
+        "nombre", "edad", "años tiene", "a que se dedica", "rompe hielo",
+        "problema visual", "ojo rojo", "ojo seco", "infecciones oculares",
+        "glaucoma", "miopia", "hipermetropia", "astigmatismo", "presbicia"
+    ],
+    "uso_compra": [
+        "productos oftalmicos", "para los ojos", "presentacion", "compra",
+        "lugar", "por que compra", "marca", "prefiere", "tienda", "farmacia"
+    ],
+    "empaque_comunicacion": [
+        "empaque", "vd", "az", "colores", "tipografia", "exhibicion", "diseno",
+        "atractivo", "intencion de compra", "comparacion", "competidores",
+        "la sante", "beneficios", "comunicar", "marca"
+    ],
+}
+
+def _score_bucket(q: str) -> str:
+    t = _norm_text(q)
+    best_label, best_hits = "empaque_comunicacion", 0
+    for label, kws in _KEYWORDS.items():
+        hits = sum(1 for k in kws if k in t)
+        if hits > best_hits:
+            best_label, best_hits = label, hits
+    return best_label
+
+def _fallback_pack_into_three(structure_titles: List[str], questions: List[str]) -> Dict[str, Any]:
+    caps = [{
+        "titulo": structure_titles[0] if structure_titles else "Capítulo 1",
+        "subcapitulos": [
+            {"titulo": "Perfil y antecedentes", "preguntas": []},
+            {"titulo": "Uso, compra y marca", "preguntas": []},
+            {"titulo": "Evaluación de empaque y comunicación", "preguntas": []},
+        ]
+    }]
+    for q in questions:
+        lab = _score_bucket(q)
+        if lab == "perfil":
+            caps[0]["subcapitulos"][0]["preguntas"].append(q)
+        elif lab == "uso_compra":
+            caps[0]["subcapitulos"][1]["preguntas"].append(q)
+        else:
+            caps[0]["subcapitulos"][2]["preguntas"].append(q)
+    return {"capitulos": caps}
 
 # ---------- Caso sin guía (generación completa) ----------
 def build_matrix_no_guide(
@@ -454,12 +520,11 @@ NO hay guía. Genera EXACTAMENTE {n_questions} preguntas y organízalas en capí
     raw = llm.chat_json(sys, user, temperature=0.15)
     return safe_json_loads(raw)
 
-# ---------- Normalizaciones de exportación ----------
+# ---------- Normalización de exportación ----------
 def normalize_question_for_excel(q: str) -> str:
-    # Q sin saltos de línea internos/cortes
     if q is None:
         return ""
-    t = q.replace("\r\n", " ").replace("\n", " ").replace("\r", " ")
+    t = q.replace("\r\n"," ").replace("\n"," ").replace("\r"," ")
     t = re.sub(r"\s+", " ", t).strip()
     return t
 
@@ -468,27 +533,23 @@ def to_dataframe(matrix: Dict[str, Any]) -> pd.DataFrame:
     for cap in matrix.get("capitulos", []):
         cap_title = (cap.get("titulo") or "").strip()
         subs = cap.get("subcapitulos", []) or []
-        # Garantizar EXACTAMENTE 3 subcapítulos visibles (si LLM devolvió menos/más, ajustar sin perder preguntas)
-        # 1) tomar los primeros 3; 2) si menos de 3, crear vacíos
-        if len([s for s in subs if s.get("titulo") != "Preguntas sin asignar"]) < 3:
-            # rellenar
-            while len([s for s in subs if s.get("titulo") != "Preguntas sin asignar"]) < 3:
-                subs.append({"titulo": f"Subcapítulo {len(subs)+1}", "preguntas": []})
-        if len([s for s in subs if s.get("titulo") != "Preguntas sin asignar"]) > 3:
-            # fusionar excedentes dentro del 3ro
-            core = [s for s in subs if s.get("titulo") != "Preguntas sin asignar"]
-            extras = core[3:]
-            core = core[:3]
+
+        # Forzar exactamente 3 subcapítulos visibles
+        visibles = [s for s in subs if s.get("titulo") != "Preguntas sin asignar"]
+        while len(visibles) < 3:
+            visibles.append({"titulo": f"Subcapítulo {len(visibles)+1}", "preguntas": []})
+        if len(visibles) > 3:
+            extras = visibles[3:]
+            visibles = visibles[:3]
             merged = []
             for e in extras:
                 merged.extend(e.get("preguntas", []) or [])
             if merged:
-                core[2].setdefault("preguntas", []).extend(merged)
-            # mantener bucket si existía
-            bucket = [s for s in subs if s.get("titulo") == "Preguntas sin asignar"]
-            subs = core + bucket
+                visibles[2].setdefault("preguntas", []).extend(merged)
+        bucket = [s for s in subs if s.get("titulo") == "Preguntas sin asignar"]
+        subs_final = visibles + bucket
 
-        for sub in subs:
+        for sub in subs_final:
             sub_title = (sub.get("titulo") or "").strip()
             for q in sub.get("preguntas", []) or []:
                 rows.append({
@@ -520,7 +581,7 @@ async def generate_matrix(
     contexto_objetivos: UploadFile = File(...),     # UN SOLO PDF (contexto+objetivos)
     transcripcion: UploadFile = File(...),          # TRANSCRIPCIÓN (contexto; NO extrae preguntas)
     guia: UploadFile | None = File(None),           # GUÍA (opcional)
-    num_questions: int | None = Form(None),         # requerido SOLO si no hay guía (40..120; default 60)
+    num_questions: int | None = Form(None),         # si no hay guía (40..120; default 60)
     filename_base: str | None = Form(None),
 ):
     # Límite de carga
@@ -568,10 +629,20 @@ async def generate_matrix(
 
         # 4) Construcción de la matriz
         if has_guide:
-            # A: estructura con 3 subcapítulos por capítulo
             structure = build_structure_only(llm, co_sum, tr_sum)
-            # B: assignments exactos (sin cortar preguntas)
             matrix = classify_by_assignments(llm, structure, preguntas, co_sum, tr_sum)
+
+            # --- Fallback si el LLM dejó muchas sin asignar ---
+            total_qs = len(preguntas)
+            assigned = sum(
+                len(s.get("preguntas") or [])
+                for cap in matrix.get("capitulos", [])
+                for s in cap.get("subcapitulos", []) or []
+            )
+            if total_qs and assigned < int(0.65 * total_qs):
+                struct_titles = [c.get("titulo","Capítulo 1") for c in structure.get("capitulos",[])]
+                matrix = _fallback_pack_into_three(struct_titles, preguntas)
+
         else:
             n = 60 if (num_questions is None) else int(num_questions)
             n = max(40, min(120, n))
