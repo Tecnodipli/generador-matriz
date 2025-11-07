@@ -6,7 +6,7 @@ import zipfile
 import secrets
 import pdfplumber
 import pandas as pd
-from typing import List, Optional, Dict, Any
+from typing import List, Optional, Dict, Any, Tuple
 from datetime import datetime, timedelta
 from threading import Lock
 
@@ -195,7 +195,7 @@ def hierarchical_summarize(llm: LLMClient, raw_text: str, label: str) -> str:
     return final
 
 # =========================
-# Extracción de preguntas SOLO desde GUÍA (SIN deduplicar)
+# Extracción de preguntas SOLO desde GUÍA (sin deduplicar)
 # =========================
 _INTERROGATIVOS = r"(qué|como|cómo|cual|cuál|cuando|cuándo|donde|dónde|quien|quién|por qué|para qué|cuanto|cuánto|cuales|cuáles)"
 _IS_INSTR = re.compile(r"^\s*(moderador:|se graba|\(se graba\))", re.IGNORECASE)
@@ -211,7 +211,7 @@ def _is_questionish(s: str) -> bool:
     return re.match(rf"^\s*{_INTERROGATIVOS}\b", s, re.IGNORECASE) is not None
 
 def extract_questions_from_guide(text: str) -> List[str]:
-    """Extrae preguntas de la GUÍA manteniendo el ORDEN y SIN deduplicar."""
+    """Extrae preguntas de la GUÍA manteniendo ORDEN y SIN deduplicar."""
     if not text:
         return []
     lines = [_clean_line(l) for l in text.splitlines()]
@@ -225,10 +225,8 @@ def extract_questions_from_guide(text: str) -> List[str]:
             j = i + 1
             while j < len(lines):
                 nxt = lines[j]
-                if _is_questionish(nxt):
-                    break
-                if re.match(r"^[A-ZÁÉÍÓÚÑ].{0,80}$", nxt):  # encabezado
-                    break
+                if _is_questionish(nxt): break
+                if re.match(r"^[A-ZÁÉÍÓÚÑ].{0,80}$", nxt): break
                 buf.append(nxt)
                 j += 1
             q = " ".join(buf).strip()
@@ -238,56 +236,59 @@ def extract_questions_from_guide(text: str) -> List[str]:
             i = j
         else:
             i += 1
-    return out  # ¡sin dedup!
+    return out
 
 # =========================
-# Instrucciones DINÁMICAS (dos pasos cuando hay guía)
+# Prompts (estructura y asignación exacta, 3 subcapítulos)
 # =========================
 STRUCTURE_ONLY_PROMPT = """
-Devuelve SOLO un objeto JSON con la estructura:
+Devuelve SOLO un objeto JSON con:
 {
   "capitulos": [
-    { "titulo": "string", "subcapitulos": [ { "titulo": "string" }, ... ] }
+    { "titulo": "string", "subcapitulos": [ { "titulo": "string" }, { "titulo": "string" }, { "titulo": "string" } ] }
   ]
 }
 REGLAS:
-- Propón capítulos y subcapítulos DINÁMICOS a tono de informe, basados en CONTEXTO y TRANSCRIPCIÓN (esta última sólo como referencia de tono/secuencia).
-- No agregues campo "preguntas" en este paso.
-- Títulos breves (≤ 70 caracteres), informativos y sin jerga innecesaria.
+- Propón capítulos (>=1) y EXACTAMENTE 3 subcapítulos por capítulo.
+- Títulos informativos, tono de informe, <= 70 caracteres.
+- Basado en CONTEXTO y TRANSCRIPCIÓN (esta última sólo para tono/secuencia; NO extraigas diálogos).
 """
 
-CLASSIFY_PROMPT = """
-Tienes una estructura de capítulos/subcapítulos y una lista de PREGUNTAS (de una GUÍA). 
-Asigna CADA pregunta EXACTAMENTE a un (capítulo, subcapítulo) de la estructura SIN modificar el texto ni el conteo.
-Si alguna no encaja, colócala en "Preguntas sin asignar" dentro del primer capítulo (créalo si no existe).
+ASSIGNMENT_PROMPT = """
+Tienes una ESTRUCTURA de capítulos/subcapítulos y una LISTA de PREGUNTAS de una GUÍA.
 Devuelve JSON con:
 {
-  "capitulos": [
-    { "titulo": "string", "subcapitulos": [ { "titulo": "string", "preguntas": ["..."] } ] }
+  "assignments":[
+    {"question":"<texto exacto>", "capitulo":"<título existente>", "subcapitulo":"<título existente>"},
+    ...
   ]
 }
-No inventes preguntas nuevas.
+REGLAS:
+- CADA pregunta debe aparecer EXACTAMENTE una vez (mismo texto, sin editar).
+- NO inventes ni cambies preguntas.
+- Usa exclusivamente los títulos de capítulo/subcapítulo existentes en la ESTRUCTURA.
+- Si alguna no encaja, asígnala a "Preguntas sin asignar" del PRIMER capítulo (usa ese literal como subcapítulo).
 """
 
-MATRIX_INSTRUCTIONS_DYNAMIC = """
-Estructura objetivo:
+GENERATE_DYNAMIC_PROMPT = """
+Objetivo: crear una matriz con capítulos y EXACTAMENTE 3 subcapítulos por capítulo.
+Estructura JSON final:
 {
   "capitulos": [
     {
       "titulo": "string",
       "subcapitulos": [
+        {"titulo": "string", "preguntas": ["string", ...]},
+        {"titulo": "string", "preguntas": ["string", ...]},
         {"titulo": "string", "preguntas": ["string", ...]}
       ]
     }
   ]
 }
 REGLAS:
-- CAPÍTULOS y SUBCAPÍTULOS DINÁMICOS, tono de informe.
-- La TRANSCRIPCIÓN se usa SOLO como CONTEXTO (no extraigas diálogos).
-- Si NO hay GUÍA: genera EXACTAMENTE N preguntas, claras y neutrales.
-- Mantén el orden en lo posible.
-- 2–5 subcapítulos por capítulo es un rango razonable; ajusta según contenido.
-- Títulos ≤ 70 caracteres.
+- Genera títulos informativos (<=70 caracteres) con tono de informe.
+- La TRANSCRIPCIÓN es SOLO contexto (tono/secuencia), no extraigas diálogos.
+- Genera EXACTAMENTE N preguntas en total, claras y neutrales, y distribúyelas en los subcapítulos.
 """
 
 def extract_json_block(text: str) -> Optional[str]:
@@ -323,7 +324,7 @@ def safe_json_loads(s: str) -> Dict[str, Any]:
         return json.loads(blk)
     raise ValueError("No se pudo parsear JSON.")
 
-# ---------- Paso A (estructura) + Paso B (clasificación) cuando HAY guía ----------
+# ---------- Paso A: estructura (exactamente 3 subcapítulos) ----------
 def build_structure_only(llm: LLMClient, co_sum: str, transcript_sum: str) -> Dict[str, Any]:
     sys = "Eres Research Lead. Defines capítulos y subcapítulos informativos."
     user = f"""CONTEXTO (resumen):
@@ -336,105 +337,165 @@ TRANSCRIPCIÓN (resumen como contexto; no extraer diálogos):
 """
     raw = llm.chat_json(sys, user, temperature=0.15)
     data = safe_json_loads(raw)
-    # normaliza forma: subcapitulos deben ser objetos {"titulo": "..."}
-    caps = []
-    for cap in data.get("capitulos", []):
-        title = (cap.get("titulo") or "").strip() or "Capítulo 1"
-        subs = cap.get("subcapitulos", []) or []
-        norm_subs = []
-        for s in subs:
-            if isinstance(s, dict):
-                t = (s.get("titulo") or "").strip() or "Bloque"
-            else:
-                t = str(s).strip() or "Bloque"
-            norm_subs.append({"titulo": t})
-        if not norm_subs:
-            norm_subs = [{"titulo": "Bloque 1"}]
-        caps.append({"titulo": title, "subcapitulos": norm_subs})
-    if not caps:
-        caps = [{"titulo": "Capítulo 1", "subcapitulos": [{"titulo": "Bloque 1"}]}]
-    return {"capitulos": caps}
 
-def classify_questions_into_structure(
+    # Normalización: asegurar EXACTAMENTE 3 subcapítulos por capítulo
+    caps_out = []
+    for i, cap in enumerate(data.get("capitulos", []) or [], 1):
+        cap_title = (cap.get("titulo") or f"Capítulo {i}").strip()
+        subs = cap.get("subcapitulos", []) or []
+        # Coerce to list of dicts with titulo
+        norm = []
+        for j, s in enumerate(subs, 1):
+            t = s.get("titulo") if isinstance(s, dict) else str(s)
+            t = (t or f"Subcapítulo {j}").strip()
+            norm.append({"titulo": t})
+        # pad / trim to 3
+        while len(norm) < 3:
+            norm.append({"titulo": f"Subcapítulo {len(norm)+1}"})
+        if len(norm) > 3:
+            norm = norm[:3]
+        caps_out.append({"titulo": cap_title, "subcapitulos": norm})
+    if not caps_out:
+        caps_out = [{"titulo": "Capítulo 1", "subcapitulos": [{"titulo": "Subcapítulo 1"},{"titulo": "Subcapítulo 2"},{"titulo": "Subcapítulo 3"}]}]
+    return {"capitulos": caps_out}
+
+# ---------- Paso B: Asignación EXACTA (no cortar preguntas) ----------
+def classify_by_assignments(
     llm: LLMClient,
     structure: Dict[str, Any],
     questions: List[str],
     co_sum: str,
     transcript_sum: str,
 ) -> Dict[str, Any]:
-    sys = "Eres Research Lead. Clasificas preguntas en capítulos/subcapítulos dados sin cambiar el texto."
+    sys = "Eres Research Lead. Asignas preguntas a una estructura dada sin cambiarlas."
     struct_min = json.dumps(structure, ensure_ascii=False)
     qs_blob = "\n".join(f"- {q}" for q in questions)
     user = f"""ESTRUCTURA:
 {struct_min}
 
-PREGUNTAS (usa exactamente estas; no inventes ni edites):
+PREGUNTAS (usa exactamente estas; no las edites):
 {qs_blob}
 
 Referencia (contexto):
 - CONTEXTO: {co_sum[:900]}
 - TRANSCRIPCIÓN: {transcript_sum[:900]}
 
-{CLASSIFY_PROMPT}
+{ASSIGNMENT_PROMPT}
 """
     raw = llm.chat_json(sys, user, temperature=0.1)
     data = safe_json_loads(raw)
 
-    # seguridad: aseguro que TODAS las preguntas estén en la salida
-    assigned = []
-    for cap in data.get("capitulos", []):
-        for sub in cap.get("subcapitulos", []) or []:
-            for q in sub.get("preguntas", []) or []:
-                assigned.append(q)
+    # Construir matriz desde assignments para NO partir preguntas
+    # Mapa: (cap, sub) -> list[preguntas]
+    matrix: Dict[str, Dict[str, List[str]]] = {}
+    # Pre-cargar estructura con subcapítulos y bucket "Preguntas sin asignar"
+    for cap in structure["capitulos"]:
+        ctitle = cap["titulo"]
+        matrix.setdefault(ctitle, {})
+        for sub in cap["subcapitulos"]:
+            matrix[ctitle].setdefault(sub["titulo"], [])
+        # bucket por si acaso
+        matrix[ctitle].setdefault("Preguntas sin asignar", [])
 
-    # Preguntas faltantes -> agregarlas a "Preguntas sin asignar"
-    missing = [q for q in questions if q not in assigned]
+    # Insertar assignments (respetando texto exacto)
+    for a in data.get("assignments", []):
+        q = (a.get("question") or "").strip()
+        c = (a.get("capitulo") or "").strip()
+        s = (a.get("subcapitulo") or "").strip()
+        if not q:
+            continue
+        if not c or c not in matrix:
+            # cae al primer capítulo
+            c = list(matrix.keys())[0]
+        if not s or s not in matrix[c]:
+            s = "Preguntas sin asignar"
+        matrix[c][s].append(q)
 
-    if missing:
-        # busca primer capítulo / subcapítulo "Preguntas sin asignar"; si no existe, créalo
-        if not data.get("capitulos"):
-            data["capitulos"] = [{"titulo": "Capítulo 1", "subcapitulos": []}]
-        first_cap = data["capitulos"][0]
-        found_bucket = None
-        for sub in first_cap.get("subcapitulos", []):
-            if (sub.get("titulo") or "").strip().lower() == "preguntas sin asignar":
-                found_bucket = sub
-                break
-        if not found_bucket:
-            found_bucket = {"titulo": "Preguntas sin asignar", "preguntas": []}
-            first_cap.setdefault("subcapitulos", []).append(found_bucket)
-        found_bucket.setdefault("preguntas", []).extend(missing)
+    # Asegurar que TODAS las preguntas están (si faltó alguna, enviar a bucket)
+    assigned_flat = {q for caps in matrix.values() for lst in caps.values() for q in lst}
+    for q in questions:
+        if q not in assigned_flat:
+            first_cap = list(matrix.keys())[0]
+            matrix[first_cap]["Preguntas sin asignar"].append(q)
 
-    return data
+    # Construir objeto matriz final
+    out_caps = []
+    for ctitle, submap in matrix.items():
+        subs = []
+        # Mantener EXACTAMENTE 3 subcapítulos visibles + bucket si quedó algo
+        # Tomar primero los 3 que estaban en la estructura
+        base_subs = [s["titulo"] for s in next(c for c in structure["capitulos"] if c["titulo"]==ctitle)["subcapitulos"]]
+        for stitle in base_subs:
+            subs.append({"titulo": stitle, "preguntas": submap.get(stitle, [])})
+        # si hay en "Preguntas sin asignar", lo agregamos como 4to extra (no cuenta para la regla de 3)
+        extra = submap.get("Preguntas sin asignar", [])
+        if extra:
+            subs.append({"titulo": "Preguntas sin asignar", "preguntas": extra})
+        out_caps.append({"titulo": ctitle, "subcapitulos": subs})
+    return {"capitulos": out_caps}
 
-# ---------- Caso sin guía (generación dinámica completa) ----------
+# ---------- Caso sin guía (generación completa) ----------
 def build_matrix_no_guide(
     llm: LLMClient,
     co_sum: str,
     transcript_sum: str,
     n_questions: int,
 ) -> Dict[str, Any]:
-    sys = "Eres Research Lead experto en cualitativo. Diseñas estructuras de INFORME y generas preguntas."
+    sys = "Eres Research Lead experto en cualitativo. Diseñas estructuras y generas preguntas."
     user = f"""CONTEXTO (resumen):
 {co_sum}
 
 TRANSCRIPCIÓN (resumen como contexto; no extraer diálogos):
 {transcript_sum}
 
-NO hay guía. Genera EXACTAMENTE {n_questions} preguntas y organízalas en capítulos/subcapítulos.
-{MATRIX_INSTRUCTIONS_DYNAMIC}
+NO hay guía. Genera EXACTAMENTE {n_questions} preguntas y organízalas en capítulos con EXACTAMENTE 3 subcapítulos cada uno.
+{GENERATE_DYNAMIC_PROMPT}
 """
     raw = llm.chat_json(sys, user, temperature=0.15)
     return safe_json_loads(raw)
+
+# ---------- Normalizaciones de exportación ----------
+def normalize_question_for_excel(q: str) -> str:
+    # Q sin saltos de línea internos/cortes
+    if q is None:
+        return ""
+    t = q.replace("\r\n", " ").replace("\n", " ").replace("\r", " ")
+    t = re.sub(r"\s+", " ", t).strip()
+    return t
 
 def to_dataframe(matrix: Dict[str, Any]) -> pd.DataFrame:
     rows = []
     for cap in matrix.get("capitulos", []):
         cap_title = (cap.get("titulo") or "").strip()
-        for sub in cap.get("subcapitulos", []) or []:
+        subs = cap.get("subcapitulos", []) or []
+        # Garantizar EXACTAMENTE 3 subcapítulos visibles (si LLM devolvió menos/más, ajustar sin perder preguntas)
+        # 1) tomar los primeros 3; 2) si menos de 3, crear vacíos
+        if len([s for s in subs if s.get("titulo") != "Preguntas sin asignar"]) < 3:
+            # rellenar
+            while len([s for s in subs if s.get("titulo") != "Preguntas sin asignar"]) < 3:
+                subs.append({"titulo": f"Subcapítulo {len(subs)+1}", "preguntas": []})
+        if len([s for s in subs if s.get("titulo") != "Preguntas sin asignar"]) > 3:
+            # fusionar excedentes dentro del 3ro
+            core = [s for s in subs if s.get("titulo") != "Preguntas sin asignar"]
+            extras = core[3:]
+            core = core[:3]
+            merged = []
+            for e in extras:
+                merged.extend(e.get("preguntas", []) or [])
+            if merged:
+                core[2].setdefault("preguntas", []).extend(merged)
+            # mantener bucket si existía
+            bucket = [s for s in subs if s.get("titulo") == "Preguntas sin asignar"]
+            subs = core + bucket
+
+        for sub in subs:
             sub_title = (sub.get("titulo") or "").strip()
             for q in sub.get("preguntas", []) or []:
-                rows.append({"Capitulo": cap_title, "Subcapitulo": sub_title, "Preguntas": (q or "").strip()})
+                rows.append({
+                    "Capitulo": cap_title,
+                    "Subcapitulo": sub_title,
+                    "Preguntas": normalize_question_for_excel(q)
+                })
     return pd.DataFrame(rows, columns=["Capitulo", "Subcapitulo", "Preguntas"])
 
 def _sanitize_filename(name: Optional[str], default: str) -> str:
@@ -484,7 +545,7 @@ async def generate_matrix(
         if guia_bytes is not None and guia and (not guia.filename.lower().endswith(".pdf")):
             raise HTTPException(status_code=400, detail="La GUÍA debe ser PDF.")
 
-        # 1) Extraer texto (con límites de páginas)
+        # 1) Extraer texto
         co_raw = extract_text_from_pdf(co_bytes, max_pages=MAX_PAGES_CO)
         tr_raw = extract_text_from_pdf(tr_bytes, max_pages=MAX_PAGES_TR)
         guide_raw = extract_text_from_pdf(guia_bytes, max_pages=MAX_PAGES_GUIDE) if guia_bytes else ""
@@ -494,7 +555,7 @@ async def generate_matrix(
         if not tr_raw.strip():
             raise HTTPException(status_code=422, detail="La TRANSCRIPCIÓN no contiene texto extraíble.")
 
-        # 2) LLM: resúmenes (transcripción solo como contexto)
+        # 2) Resúmenes
         llm = LLMClient(model=None)
         co_sum = hierarchical_summarize(llm, co_raw, "Contexto+Objetivos")
         tr_sum = hierarchical_summarize(llm, tr_raw, "Transcripción (contexto)")
@@ -502,15 +563,15 @@ async def generate_matrix(
         # 3) ¿Hay guía?
         preguntas: Optional[List[str]] = None
         if guide_raw:
-            preguntas = extract_questions_from_guide(guide_raw)  # SIN dedup
+            preguntas = extract_questions_from_guide(guide_raw)
         has_guide = bool(preguntas and len(preguntas) > 0)
 
         # 4) Construcción de la matriz
         if has_guide:
-            # Paso A: estructura sin preguntas
+            # A: estructura con 3 subcapítulos por capítulo
             structure = build_structure_only(llm, co_sum, tr_sum)
-            # Paso B: clasificar EXACTAMENTE las preguntas de la guía en esa estructura
-            matrix = classify_questions_into_structure(llm, structure, preguntas, co_sum, tr_sum)
+            # B: assignments exactos (sin cortar preguntas)
+            matrix = classify_by_assignments(llm, structure, preguntas, co_sum, tr_sum)
         else:
             n = 60 if (num_questions is None) else int(num_questions)
             n = max(40, min(120, n))
