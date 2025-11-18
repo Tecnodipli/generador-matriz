@@ -521,8 +521,58 @@ def normalize_question_for_excel(q: str) -> str:
     t = re.sub(r"\s+", " ", t).strip()
     return t
 
+# Filas fijas que siempre deben ir al inicio de la matriz
+DEFAULT_PROFILE_ROWS = [
+    {
+        "Capitulo": "Perfil",
+        "Subcapitulo": "Perfil de entrevistado",
+        "Preguntas": "¿Cuál es su nombre?",
+    },
+    {
+        "Capitulo": "Profundización en datos de entrevistados",
+        "Subcapitulo": "Demográficos",
+        "Preguntas": "¿Qué edad tiene?",
+    },
+    {
+        "Capitulo": "Profundización en datos de entrevistados",
+        "Subcapitulo": "Demográficos",
+        "Preguntas": "¿A qué segmento pertenece?",
+    },
+    {
+        "Capitulo": "Profundización en datos de entrevistados",
+        "Subcapitulo": "Demográficos",
+        "Preguntas": "¿En qué ciudad o municipio vive?",
+    },
+    {
+        "Capitulo": "Profundización en datos de entrevistados",
+        "Subcapitulo": "Demográficos",
+        "Preguntas": "¿Con qué género se identifica?",
+    },
+    {
+        "Capitulo": "Profundización en datos de entrevistados",
+        "Subcapitulo": "Demográficos",
+        "Preguntas": "¿A qué estrato pertenece?",
+    },
+]
+
 def to_dataframe(matrix: Dict[str, Any]) -> pd.DataFrame:
     rows = []
+
+    # 0) Set de preguntas fijas normalizadas para evitar duplicados
+    default_q_set = {
+        normalize_question_for_excel(r["Preguntas"])
+        for r in DEFAULT_PROFILE_ROWS
+    }
+
+    # 1) Filas fijas al inicio
+    for r in DEFAULT_PROFILE_ROWS:
+        rows.append({
+            "Capitulo": r["Capitulo"],
+            "Subcapitulo": r["Subcapitulo"],
+            "Preguntas": normalize_question_for_excel(r["Preguntas"]),
+        })
+
+    # 2) Resto de la matriz generada
     for cap in matrix.get("capitulos", []):
         cap_title = (cap.get("titulo") or "").strip()
         subs = cap.get("subcapitulos", []) or []
@@ -545,11 +595,18 @@ def to_dataframe(matrix: Dict[str, Any]) -> pd.DataFrame:
         for sub in subs_final:
             sub_title = (sub.get("titulo") or "").strip()
             for q in sub.get("preguntas", []) or []:
+                norm_q = normalize_question_for_excel(q)
+
+                # Si la pregunta ya está en el bloque fijo de perfil, no la repetimos
+                if norm_q in default_q_set:
+                    continue
+
                 rows.append({
                     "Capitulo": cap_title,
                     "Subcapitulo": sub_title,
-                    "Preguntas": normalize_question_for_excel(q)
+                    "Preguntas": norm_q,
                 })
+
     return pd.DataFrame(rows, columns=["Capitulo", "Subcapitulo", "Preguntas"])
 
 def _sanitize_filename(name: Optional[str], default: str) -> str:
