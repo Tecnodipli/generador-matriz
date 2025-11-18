@@ -37,11 +37,11 @@ ALLOWED_ORIGINS = [
     "https://*.wixsite.com",
     "https://generador-matriz.onrender.com",
 ]
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=ALLOWED_ORIGINS,
-    allow_origin_regex=r"https://.*\.(filesusr|wixsite)\.com",
-    allow_credentials=True,
+    allow_origins=["*"],        
+    allow_credentials=False,    
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -765,3 +765,4 @@ def download_token(token: str):
         "Cache-Control": "no-store",
     }
     return StreamingResponse(io.BytesIO(data), media_type=media_type, headers=headers)
+
